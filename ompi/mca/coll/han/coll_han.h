@@ -137,11 +137,15 @@ struct mca_coll_han_allreduce_args_s {
 };
 typedef struct mca_coll_han_allreduce_args_s mca_coll_han_allreduce_args_t;
 
+/* Forward declaration needed by scatter and gather arg structs */
+typedef struct mca_coll_han_module_t mca_coll_han_module_t;
+
 struct mca_coll_han_scatter_args_s {
     mca_coll_task_t *cur_task;
     ompi_communicator_t *up_comm;
     ompi_communicator_t *low_comm;
     ompi_request_t *req;
+    mca_coll_han_module_t *han_module;
     void *sbuf;
     void *sbuf_inter_free;
     void *sbuf_reorder_free;
@@ -155,6 +159,10 @@ struct mca_coll_han_scatter_args_s {
     int root_low_rank;
     int w_rank;
     bool noop;
+    opal_free_list_item_t *inter_fl_item;   /* freelist item for inter-node buf */
+    int inter_fl_src;                        /* 0=malloc, 1=large, 2=small */
+    opal_free_list_item_t *reorder_fl_item; /* freelist item for reorder buf */
+    int reorder_fl_src;                      /* 0=malloc, 1=large, 2=small */
 };
 typedef struct mca_coll_han_scatter_args_s mca_coll_han_scatter_args_t;
 
@@ -163,6 +171,7 @@ struct mca_coll_han_gather_args_s {
     ompi_communicator_t *up_comm;
     ompi_communicator_t *low_comm;
     ompi_request_t *req;
+    mca_coll_han_module_t *han_module;
     void *sbuf;
     void *sbuf_inter_free;
     void *rbuf;
@@ -178,9 +187,6 @@ struct mca_coll_han_gather_args_s {
     bool is_mapbycore;
 };
 typedef struct mca_coll_han_gather_args_s mca_coll_han_gather_args_t;
-
-/* Forward declaration for allgather structure */
-typedef struct mca_coll_han_module_t mca_coll_han_module_t;
 
 struct mca_coll_han_allgather_s {
     mca_coll_task_t *cur_task;
@@ -430,6 +436,18 @@ typedef struct mca_coll_han_module_t {
     /* Cached gather buffer for three-tier allocation */
     void *cached_gather_buf;
     size_t cached_gather_buf_size;
+    /* Persistent buffer for scatter inter-node recv (realloc-to-HWM) */
+    char *scatter_persist;
+    size_t scatter_persist_size;
+    /* Persistent scatter root reorder buffer (realloc-to-HWM) */
+    char *scatter_reorder_persist;
+    size_t scatter_reorder_persist_size;
+    /* Persistent gather root reorder buffer (realloc-to-HWM) */
+    char *gather_reorder_persist;
+    size_t gather_reorder_persist_size;
+    /* Persistent reduce task-based tmp buffer (realloc-to-HWM) */
+    char *reduce_tmp_persist;
+    size_t reduce_tmp_persist_size;
 } mca_coll_han_module_t;
 OBJ_CLASS_DECLARATION(mca_coll_han_module_t);
 
