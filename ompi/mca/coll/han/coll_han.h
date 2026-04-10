@@ -447,6 +447,37 @@ typedef struct mca_coll_han_module_t {
        via realloc so the NIC rcache registration stays valid. */
     char *alltoall_bounce;
     size_t alltoall_bounce_size;
+    /* Cached SMSC mappings for alltoall — avoid per-call map/unmap+allgather */
+    const void *a2a_cached_sbuf;       /* sbuf from last call (cache key) */
+    size_t a2a_cached_scount;          /* scount from last call */
+    int a2a_cached_low_size;           /* low_size from last call */
+    char **a2a_low_bufs;               /* cached local peer buffer pointers */
+    void **a2a_map_ctx;                /* cached SMSC map contexts */
+    void **a2a_gather_buf;             /* cached allgather output */
+    int a2a_cached_send_needs_bounce;  /* cached send_needs_bounce */
+    int a2a_cached_ii_push_data;       /* cached ii_push_data */
+    /* Persistent recv buffer for alltoall inter-node receives */
+    char *alltoall_recv_buf;
+    size_t alltoall_recv_buf_size;
+
+    /* Alltoallv persistent allocations */
+    uint8_t *a2av_serial_buf;
+    size_t a2av_serial_buf_size;
+    void *a2av_gather_out;
+    void *a2av_peers;
+    void *a2av_peer_types;
+    int a2av_low_size;
+    void **a2av_send_from;
+    void **a2av_recv_to;
+    size_t *a2av_send_counts;
+    size_t *a2av_recv_counts;
+    void **a2av_send_types;
+    void **a2av_recv_types;
+    int a2av_cached_low_size_cache;
+    bool a2av_have_mappings;
+    ssize_t *a2av_cached_spans;
+    bool a2av_smsc_decided;
+    int a2av_use_smsc;
 
     /* Sub-communicator */
     struct ompi_communicator_t *sub_comm[NB_TOPO_LVL];

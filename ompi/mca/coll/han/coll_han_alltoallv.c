@@ -769,11 +769,39 @@ int mca_coll_han_alltoallv_using_smsc(
     int w_size = ompi_comm_size(comm);
 
     int use_smsc;
-    rc = decide_to_use_smsc_alg(&use_smsc,
-        sbuf, scounts, sdispls, sdtype, rbuf, rcounts, rdispls, rdtype, comm);
-    if (rc != 0) {
-        opal_output_verbose(1, mca_coll_han_component.han_output,
-            "decide_to_use_smsc_alg failed during execution! rc=%d\n", rc);
+    if (sbuf == MPI_IN_PLACE) {
+        return han_module->previous_alltoallv(sbuf, scounts, sdispls, sdtype, rbuf, rcounts, rdispls, rdtype,
+                                             comm, han_module->previous_alltoallv_module);
+    }
+
+    /* Compute local avg send size to decide if we can use cached result.
+     * Only cache when sends are small (below smsc_avg_send_limit) — at large
+     * sizes the baseline algorithm is faster and we must not bypass it. */
+    size_t local_avg_send = 0;
+    {
+        size_t stype_size;
+        ompi_datatype_type_size(sdtype, &stype_size);
+        for (int j = 0; j < w_size; j++)
+            local_avg_send += stype_size * ompi_count_array_get(scounts, j);
+        local_avg_send /= w_size;
+    }
+
+    if (mca_coll_han_component.han_use_persist_buffers
+        && local_avg_send < (size_t)mca_coll_han_component.han_alltoallv_smsc_avg_send_limit
+        && han_module->a2av_smsc_decided) {
+        use_smsc = han_module->a2av_use_smsc;
+    } else {
+        rc = decide_to_use_smsc_alg(&use_smsc,
+            sbuf, scounts, sdispls, sdtype, rbuf, rcounts, rdispls, rdtype, comm);
+        if (rc != 0) {
+            opal_output_verbose(1, mca_coll_han_component.han_output,
+                "decide_to_use_smsc_alg failed during execution! rc=%d\n", rc);
+        }
+        if (mca_coll_han_component.han_use_persist_buffers
+            && local_avg_send < (size_t)mca_coll_han_component.han_alltoallv_smsc_avg_send_limit) {
+            han_module->a2av_smsc_decided = true;
+            han_module->a2av_use_smsc = use_smsc;
+        }
     }
     if (!use_smsc) {
         return han_module->previous_alltoallv(sbuf, scounts, sdispls, sdtype, rbuf, rcounts, rdispls, rdtype,
@@ -799,11 +827,39 @@ int mca_coll_han_alltoallv_using_smsc(
     size_t serialization_buf_length = low_gather_in.stype_serialized_length
         + sizeof(struct peer_counts)*w_size;
 
-    /* allocate data */
-    serialization_buf = malloc(serialization_buf_length);
-    low_gather_out = malloc(sizeof(*low_gather_out) * low_size);
-    struct peer_data *peers = malloc(sizeof(*peers) * low_size);
-    opal_datatype_t *peer_send_types = malloc(sizeof(*peer_send_types) * low_size);
+    /* Persistent allocations (realloc-to-HWM) */
+    if (han_module->a2av_serial_buf_size < serialization_buf_length) {
+        free(han_module->a2av_serial_buf);
+        han_module->a2av_serial_buf = malloc(serialization_buf_length);
+        han_module->a2av_serial_buf_size = serialization_buf_length;
+    }
+    serialization_buf = han_module->a2av_serial_buf;
+    if (han_module->a2av_low_size < low_size) {
+        free(han_module->a2av_gather_out);
+        free(han_module->a2av_peers);
+        free(han_module->a2av_peer_types);
+        free(han_module->a2av_send_from);
+        free(han_module->a2av_recv_to);
+        free(han_module->a2av_send_counts);
+        free(han_module->a2av_recv_counts);
+        free(han_module->a2av_send_types);
+        free(han_module->a2av_recv_types);
+        free(han_module->a2av_cached_spans);
+        han_module->a2av_gather_out = malloc(sizeof(struct gathered_data) * low_size);
+        han_module->a2av_peers = malloc(sizeof(struct peer_data) * low_size);
+        han_module->a2av_peer_types = malloc(sizeof(opal_datatype_t) * low_size);
+        han_module->a2av_send_from = malloc(sizeof(void*) * low_size);
+        han_module->a2av_recv_to = malloc(sizeof(void*) * low_size);
+        han_module->a2av_send_counts = malloc(sizeof(size_t) * low_size);
+        han_module->a2av_recv_counts = malloc(sizeof(size_t) * low_size);
+        han_module->a2av_send_types = malloc(sizeof(opal_datatype_t*) * low_size);
+        han_module->a2av_recv_types = malloc(sizeof(opal_datatype_t*) * low_size);
+        han_module->a2av_cached_spans = calloc(low_size, sizeof(ssize_t));
+        han_module->a2av_low_size = low_size;
+    }
+    low_gather_out = han_module->a2av_gather_out;
+    struct peer_data *peers = han_module->a2av_peers;
+    opal_datatype_t *peer_send_types = han_module->a2av_peer_types;
     bool have_bufs_and_types = false;
 
     low_gather_in.serialization_buffer = serialization_buf;
@@ -815,6 +871,15 @@ int mca_coll_han_alltoallv_using_smsc(
     /* calculate the full gap and span of all accesses to our buffer: */
     coll_han_alltoallv_calc_all_span( w_size, &sdtype->super, scounts, sdispls,
                 &low_gather_in.sbuf_gap, &low_gather_in.sbuf_span );
+
+    /* Check if cached SMSC mappings are still valid.
+     * Cache key: sbuf address + sdtype + low_size.
+     * When sbuf is the same, the SMSC mappings to peer sbufs are still valid.
+     * The serialization_buf is persistent so its mapping is always valid.
+     * We still need to re-run allgather to exchange updated counts/displs. */
+    /* Disable SMSC mapping cache — always remap.
+     * Only the allreduce decision is cached (biggest win). */
+    int a2av_cache_valid = 0;
 
     /* pack the serialization buffer: first the array of counts */
     size_t buf_packed = 0;
@@ -831,6 +896,7 @@ int mca_coll_han_alltoallv_using_smsc(
     buf_packed += ddt_pack_datatype(&sdtype->super, serialization_buf + buf_packed);
     assert(buf_packed == serialization_buf_length);
 
+    /* Always run allgather — all ranks must participate (collective) */
     rc = low_comm->c_coll->coll_allgather(&low_gather_in, sizeof(low_gather_in), MPI_BYTE,
             low_gather_out, sizeof(low_gather_in), MPI_BYTE, low_comm,
             low_comm->c_coll->coll_allgather_module);
@@ -838,6 +904,32 @@ int mca_coll_han_alltoallv_using_smsc(
         opal_output_verbose(1, mca_coll_han_component.han_output,
             "During mca_coll_han_alltoallv_using_smsc: Allgather failed with rc=%d\n",rc);
         goto cleanup;
+    }
+
+    /* Check if SMSC mappings can be reused.
+     * Valid when all peers' sbuf addresses and spans haven't changed. */
+    if (a2av_cache_valid) {
+        /* Verify peer sbufs haven't moved */
+        for (int jrank = 0; jrank < low_size; jrank++) {
+            if (jrank == low_rank) continue;
+            struct gathered_data *gathered = &((struct gathered_data*)low_gather_out)[jrank];
+            if (gathered->sbuf != peers[jrank].sbuf ||
+                gathered->sbuf_span != han_module->a2av_cached_spans[jrank]) {
+                a2av_cache_valid = 0;
+                break;
+            }
+        }
+    }
+
+    if (!a2av_cache_valid) {
+    /* Old SMSC regions use MCA_RCACHE_FLAGS_PERSIST — rcache manages them.
+     * Just destruct old peer types before re-unpacking. */
+    if (han_module->a2av_have_mappings) {
+        for (int jlow = 0; jlow < han_module->a2av_cached_low_size_cache; jlow++) {
+            if (jlow != low_rank) {
+                OBJ_DESTRUCT(&peer_send_types[jlow]);
+            }
+        }
     }
 
     /*
@@ -897,13 +989,31 @@ int mca_coll_han_alltoallv_using_smsc(
         peers[jrank].sendtype = &peer_send_types[jrank];
     }
 
+    /* Update cache */
+    han_module->a2av_have_mappings = true;
+    han_module->a2av_cached_low_size_cache = low_size;
+    /* Save peer sbuf spans for cache validation */
+    for (int jrank = 0; jrank < low_size; jrank++) {
+        if (jrank != low_rank) {
+            struct gathered_data *gathered = &((struct gathered_data*)low_gather_out)[jrank];
+            han_module->a2av_cached_spans[jrank] = gathered->sbuf_span;
+        }
+    }
+
+    } else {
+        /* Cache valid: update counts from the fresh allgather but reuse SMSC mappings */
+        peers[low_rank].counts = (struct peer_counts *)serialization_buf;
+        peers[low_rank].sbuf = sbuf;
+        peers[low_rank].sendtype = &sdtype->super;
+    }
+
     have_bufs_and_types = true;
-    send_from_addrs = malloc(sizeof(*send_from_addrs)*low_size);
-    recv_to_addrs = malloc(sizeof(*recv_to_addrs)*low_size);
-    send_counts = malloc(sizeof(*send_counts)*low_size);
-    recv_counts = malloc(sizeof(*recv_counts)*low_size);
-    send_types = malloc(sizeof(*send_types)*low_size);
-    recv_types = malloc(sizeof(*recv_types)*low_size);
+    send_from_addrs = han_module->a2av_send_from;
+    recv_to_addrs = han_module->a2av_recv_to;
+    send_counts = han_module->a2av_send_counts;
+    recv_counts = han_module->a2av_recv_counts;
+    send_types = (opal_datatype_t **)han_module->a2av_send_types;
+    recv_types = (opal_datatype_t **)han_module->a2av_recv_types;
 
     /****
      *  Main exchange loop
@@ -958,12 +1068,7 @@ int mca_coll_han_alltoallv_using_smsc(
     low_comm->c_coll->coll_barrier(low_comm, low_comm->c_coll->coll_barrier_module);
 
     if (send_from_addrs) {
-        free(send_from_addrs);
-        free(recv_to_addrs);
-        free(send_counts);
-        free(recv_counts);
-        free(send_types);
-        free(recv_types);
+        /* persistent arrays — do not free */
     }
 
     if (have_bufs_and_types) {
@@ -971,7 +1076,6 @@ int mca_coll_han_alltoallv_using_smsc(
             if (jlow != low_rank) {
                 OBJ_DESTRUCT(&peer_send_types[jlow]);
             }
-
             for (int jbuf=0; jbuf<2; jbuf++) {
                 if (peers[jlow].map_ctx[jbuf]) {
                     mca_smsc->unmap_peer_region(peers[jlow].map_ctx[jbuf]);
@@ -979,10 +1083,7 @@ int mca_coll_han_alltoallv_using_smsc(
             }
         }
     }
-    free(serialization_buf);
-    free(low_gather_out);
-    free(peers);
-    free(peer_send_types);
+    /* persistent allocations — do not free */
 
     OPAL_OUTPUT_VERBOSE((40, mca_coll_han_component.han_output,
                 "Alltoall Complete with %d\n",rc));

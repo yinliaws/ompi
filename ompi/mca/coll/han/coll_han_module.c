@@ -205,6 +205,33 @@ static void mca_coll_han_module_construct(mca_coll_han_module_t * module)
     module->dynamic_errors = 0;
     module->alltoall_bounce = NULL;
     module->alltoall_bounce_size = 0;
+    module->a2a_cached_sbuf = NULL;
+    module->a2a_cached_scount = 0;
+    module->a2a_cached_low_size = 0;
+    module->a2a_low_bufs = NULL;
+    module->a2a_map_ctx = NULL;
+    module->a2a_gather_buf = NULL;
+    module->a2a_cached_send_needs_bounce = 0;
+    module->a2a_cached_ii_push_data = 0;
+    module->alltoall_recv_buf = NULL;
+    module->alltoall_recv_buf_size = 0;
+    module->a2av_serial_buf = NULL;
+    module->a2av_serial_buf_size = 0;
+    module->a2av_gather_out = NULL;
+    module->a2av_peers = NULL;
+    module->a2av_peer_types = NULL;
+    module->a2av_low_size = 0;
+    module->a2av_send_from = NULL;
+    module->a2av_recv_to = NULL;
+    module->a2av_send_counts = NULL;
+    module->a2av_recv_counts = NULL;
+    module->a2av_send_types = NULL;
+    module->a2av_recv_types = NULL;
+    module->a2av_cached_low_size_cache = 0;
+    module->a2av_have_mappings = false;
+    module->a2av_cached_spans = NULL;
+    module->a2av_smsc_decided = false;
+    module->a2av_use_smsc = 0;
 
     han_module_clear(module);
 
@@ -279,6 +306,27 @@ mca_coll_han_module_destruct(mca_coll_han_module_t * module)
     free(module->alltoall_bounce);
     module->alltoall_bounce = NULL;
     module->alltoall_bounce_size = 0;
+    if (module->a2a_map_ctx) {
+        for (i = 0; i < module->a2a_cached_low_size; i++) {
+            if (module->a2a_map_ctx[i])
+                mca_smsc->unmap_peer_region(module->a2a_map_ctx[i]);
+        }
+        free(module->a2a_map_ctx);
+    }
+    free(module->a2a_low_bufs);
+    free(module->a2a_gather_buf);
+    free(module->alltoall_recv_buf);
+    free(module->a2av_serial_buf);
+    free(module->a2av_gather_out);
+    free(module->a2av_peers);
+    free(module->a2av_peer_types);
+    free(module->a2av_send_from);
+    free(module->a2av_recv_to);
+    free(module->a2av_send_counts);
+    free(module->a2av_recv_counts);
+    free(module->a2av_send_types);
+    free(module->a2av_recv_types);
+    free(module->a2av_cached_spans);
 
     han_module_clear(module);
 }

@@ -33,6 +33,7 @@
 #include "opal/mca/smsc/smsc.h"
 #include "opal/mca/rcache/rcache.h"
 #include "ompi/mca/osc/base/base.h"
+#include <string.h>
 
 
 
@@ -218,12 +219,49 @@ int mca_coll_han_alltoall_using_smsc(
     int64_t send_bytes_per_fan = low_size * packed_size;
     inter_send_reqs = malloc(sizeof(*inter_send_reqs) * fanout);
     inter_recv_reqs = malloc(sizeof(*inter_recv_reqs) * up_size );
-    char **low_bufs = malloc(low_size * sizeof(*low_bufs));
-    void **sbuf_map_ctx = malloc(low_size * sizeof(&sbuf_map_ctx));
-    opal_free_list_item_t *send_fl_item = NULL;
 
+    /* Check if cached SMSC mappings are still valid */
+    int a2a_cache_valid = (mca_coll_han_component.han_use_persist_buffers
+                           && han_module->a2a_cached_sbuf == sbuf
+                           && han_module->a2a_cached_scount == scount
+                           && han_module->a2a_cached_low_size == low_size
+                           && han_module->a2a_low_bufs != NULL);
+
+    char **low_bufs;
+    void **sbuf_map_ctx;
+    opal_free_list_item_t *send_fl_item = NULL;
     const int nptrs_gather = 3;
-    void **gather_buf_out = calloc(low_size*nptrs_gather, sizeof(void*));
+    void **gather_buf_out;
+
+    if (a2a_cache_valid) {
+        low_bufs = han_module->a2a_low_bufs;
+        sbuf_map_ctx = han_module->a2a_map_ctx;
+        gather_buf_out = han_module->a2a_gather_buf;
+        send_needs_bounce = han_module->a2a_cached_send_needs_bounce;
+        ii_push_data = han_module->a2a_cached_ii_push_data;
+    } else {
+        /* Invalidate old cache — unmap old SMSC regions */
+        if (han_module->a2a_map_ctx) {
+            for (int i = 0; i < han_module->a2a_cached_low_size; i++) {
+                if (han_module->a2a_map_ctx[i])
+                    mca_smsc->unmap_peer_region(han_module->a2a_map_ctx[i]);
+            }
+        }
+        /* Allocate/reuse persistent arrays */
+        if (han_module->a2a_cached_low_size < low_size) {
+            free(han_module->a2a_low_bufs);
+            free(han_module->a2a_map_ctx);
+            free(han_module->a2a_gather_buf);
+            han_module->a2a_low_bufs = malloc(low_size * sizeof(char*));
+            han_module->a2a_map_ctx = malloc(low_size * sizeof(void*));
+            han_module->a2a_gather_buf = calloc(low_size * nptrs_gather, sizeof(void*));
+        }
+        low_bufs = han_module->a2a_low_bufs;
+        sbuf_map_ctx = han_module->a2a_map_ctx;
+        gather_buf_out = han_module->a2a_gather_buf;
+        memset(sbuf_map_ctx, 0, low_size * sizeof(void*));
+        memset(gather_buf_out, 0, low_size * nptrs_gather * sizeof(void*));
+    }
     int send_bounce_status = BOUNCE_NOT_INITIALIZED;
 
     do {
@@ -233,20 +271,21 @@ start_allgather:
             send_bounce_status = BOUNCE_IS_FROM_RBUF;
         } else {
             if (send_bounce_status == BOUNCE_NOT_INITIALIZED || send_bounce_status == BOUNCE_IS_FROM_RBUF) {
-                if (send_bytes_per_fan * fanout < mca_coll_han_component.han_packbuf_bytes) {
-                    send_fl_item = opal_free_list_get(&mca_coll_han_component.pack_buffers);
-                    if (send_fl_item) {
-                        send_bounce_status = BOUNCE_IS_FROM_FREELIST;
-                        send_bounce = send_fl_item->ptr;
-                    }
+                /* Persistent bounce: realloc-to-HWM avoids munmap on free
+                 * which would invalidate EFA MR cache entries. */
+                size_t needed = send_bytes_per_fan * fanout;
+                if (han_module->alltoall_bounce_size < needed) {
+                    char *p = realloc(han_module->alltoall_bounce, needed);
+                    if (NULL == p) { rc = OMPI_ERR_OUT_OF_RESOURCE; goto cleanup; }
+                    han_module->alltoall_bounce = p;
+                    han_module->alltoall_bounce_size = needed;
                 }
-                if (!send_fl_item) {
-                    send_bounce = malloc(send_bytes_per_fan * fanout);
-                    send_bounce_status = BOUNCE_IS_FROM_MALLOC;
-                }
+                send_bounce = han_module->alltoall_bounce;
+                send_bounce_status = BOUNCE_IS_FROM_MALLOC;
             }
         }
 
+        if (!a2a_cache_valid) {
         if (ii_push_data) {
             /* all ranks will push to the other ranks' bounce buffer */
             gather_buf_in[0] = send_bounce;
@@ -276,10 +315,12 @@ start_allgather:
             send_needs_bounce  |= (uintptr_t)gather_buf_out[nptrs_gather*jother + 1] & 0x1;
             ii_push_data       |= other_push_data;
         }
+        } /* !a2a_cache_valid */
     } while (0);
 
     use_isend = fanout > 1 || ii_push_data;
 
+    if (!a2a_cache_valid) {
     for (int jother=0; jother<low_size; jother++) {
         low_bufs[jother] = gather_buf_out[nptrs_gather*jother];
         if (jother == low_rank) {
@@ -297,6 +338,13 @@ start_allgather:
                 (void**) &low_bufs[jother] );
         }
     }
+    /* Update cache */
+    han_module->a2a_cached_sbuf = sbuf;
+    han_module->a2a_cached_scount = scount;
+    han_module->a2a_cached_low_size = low_size;
+    han_module->a2a_cached_send_needs_bounce = send_needs_bounce;
+    han_module->a2a_cached_ii_push_data = ii_push_data;
+    } /* !a2a_cache_valid */
 
     for (int jslot=0; jslot < fanout; jslot++) {
         inter_send_reqs[jslot] = MPI_REQUEST_NULL;
@@ -305,12 +353,21 @@ start_allgather:
 
     /* pre-post all our receives.  We will be ready to receive all data regardless of fan-out.
        (This is not an in-place algorithm)*/
+    /* Use persistent recv buffer to keep MR addresses stable */
+    size_t recv_chunk_bytes = rextent * rcount * low_size;
+    size_t recv_total = recv_chunk_bytes * up_size;
+    if (han_module->alltoall_recv_buf_size < recv_total) {
+        char *p = realloc(han_module->alltoall_recv_buf, recv_total);
+        if (NULL == p) { rc = OMPI_ERR_OUT_OF_RESOURCE; goto cleanup; }
+        han_module->alltoall_recv_buf = p;
+        han_module->alltoall_recv_buf_size = recv_total;
+    }
+
     int inter_recv_count = 0;
     for (int jround=0; jround<up_size; jround++) {
             int up_partner = ring_partner(up_rank, jround, up_size);
             int first_remote_wrank = up_partner*low_size;
-            /* pre-post the receive for remote.  Receive directly into application buffer */
-            char *recv_chunk = ((char*)rbuf) + rextent*rcount*first_remote_wrank;
+            char *recv_chunk = han_module->alltoall_recv_buf + recv_chunk_bytes * jround;
 
             MCA_PML_CALL(irecv
                         (recv_chunk, rcount*low_size, rdtype, first_remote_wrank+low_rank,
@@ -415,6 +472,15 @@ start_allgather:
     /* wait for all irecv to complete */
     ompi_request_wait_all(inter_recv_count, inter_recv_reqs, MPI_STATUS_IGNORE);
 
+    /* Copy from persistent recv buffer to application rbuf */
+    for (int jround=0; jround<inter_recv_count; jround++) {
+        int up_partner = ring_partner(up_rank, jround, up_size);
+        int first_remote_wrank = up_partner*low_size;
+        memcpy(((char*)rbuf) + rextent*rcount*first_remote_wrank,
+               han_module->alltoall_recv_buf + recv_chunk_bytes * jround,
+               recv_chunk_bytes);
+    }
+
 cleanup:
 
     /* we may still have neighbors reading directly from our buffer, so we must ensure it is not modified */
@@ -425,20 +491,17 @@ cleanup:
 
     for (int jlow=0; jlow<low_size; jlow++) {
         if (jlow != low_rank ) {
-            mca_smsc->unmap_peer_region(sbuf_map_ctx[jlow]);
+            /* SMSC mappings are cached — do not unmap */
         }
     }
     OBJ_DESTRUCT(&convertor);
     if (send_bounce_status == BOUNCE_IS_FROM_FREELIST) {
         opal_free_list_return(&mca_coll_han_component.pack_buffers, send_fl_item);
-    } else if (send_bounce_status == BOUNCE_IS_FROM_MALLOC) {
-        free(send_bounce);
     }
+    /* alltoall_bounce is persistent — do not free */
     free(inter_send_reqs);
     free(inter_recv_reqs);
-    free(sbuf_map_ctx);
-    free(low_bufs);
-    free(gather_buf_out);
+    /* low_bufs, sbuf_map_ctx, gather_buf_out are cached — do not free */
 
     OPAL_OUTPUT_VERBOSE((40, mca_coll_han_component.han_output,
                 "Alltoall Complete with %d\n",rc));
