@@ -226,10 +226,23 @@ int mca_coll_han_scatterv_intra(const void *sbuf, ompi_count_array_t scounts, om
         if (need_bounce_buf) {
             ptrdiff_t ssize, sgap;
             ssize = opal_datatype_span(&rdtype->super, total_up_scounts, &sgap);
-            bounce_buf = malloc(ssize);
-            if (!bounce_buf) {
-                err = OMPI_ERR_OUT_OF_RESOURCE;
-                goto root_out;
+            if (mca_coll_han_component.han_use_persist_buffers) {
+                if (han_module->scatterv_bounce_persist.size < (size_t)ssize) {
+                    char *p = realloc(han_module->scatterv_bounce_persist.buf, ssize);
+                    if (!p) {
+                        err = OMPI_ERR_OUT_OF_RESOURCE;
+                        goto root_out;
+                    }
+                    han_module->scatterv_bounce_persist.buf = p;
+                    han_module->scatterv_bounce_persist.size = ssize;
+                }
+                bounce_buf = han_module->scatterv_bounce_persist.buf;
+            } else {
+                bounce_buf = malloc(ssize);
+                if (!bounce_buf) {
+                    err = OMPI_ERR_OUT_OF_RESOURCE;
+                    goto root_out;
+                }
             }
             reorder_sbuf = bounce_buf - sgap;
 
@@ -293,7 +306,8 @@ int mca_coll_han_scatterv_intra(const void *sbuf, ompi_count_array_t scounts, om
         if (up_peer_ub) {
             free(up_peer_ub);
         }
-        if (bounce_buf) {
+        /* Free bounce_buf when not using persist buffers */
+        if (!mca_coll_han_component.han_use_persist_buffers) {
             free(bounce_buf);
         }
 
@@ -329,6 +343,7 @@ int mca_coll_han_scatterv_intra(const void *sbuf, ompi_count_array_t scounts, om
     /* #################### Node leaders ########################### */
 
     char *tmp_buf = NULL;
+    size_t total_rsize = 0;
 
     /* Allocate a temporary array to gather the data size, i.e. data type size x count,
      * in bytes from local peers */
@@ -349,16 +364,32 @@ int mca_coll_han_scatterv_intra(const void *sbuf, ompi_count_array_t scounts, om
         goto node_leader_out;
     }
 
-    size_t total_rsize = 0;
+    total_rsize = 0;
     for (int i = 0; i < low_size; ++i) {
         low_displs[i] = i > 0 ? low_displs[i - 1] + low_scounts[i - 1] : 0;
         total_rsize += low_scounts[i];
     }
 
-    tmp_buf = (char *) malloc(total_rsize); /* tmp_buf is still valid if total_rsize is 0 */
-    if (!tmp_buf) {
-        err = OMPI_ERR_OUT_OF_RESOURCE;
-        goto node_leader_out;
+    /* Persistent inter-node receive buffer (realloc-to-HWM) */
+    if (total_rsize == 0) {
+        tmp_buf = (char *)&tmp_buf;  /* non-NULL sentinel for zero-size case */
+    } else if (mca_coll_han_component.han_use_persist_buffers) {
+        if (han_module->scatterv_persist.size < total_rsize) {
+            char *p = realloc(han_module->scatterv_persist.buf, total_rsize);
+            if (!p) {
+                err = OMPI_ERR_OUT_OF_RESOURCE;
+                goto node_leader_out;
+            }
+            han_module->scatterv_persist.buf = p;
+            han_module->scatterv_persist.size = total_rsize;
+        }
+        tmp_buf = han_module->scatterv_persist.buf;
+    } else {
+        tmp_buf = (char *) malloc(total_rsize);
+        if (!tmp_buf) {
+            err = OMPI_ERR_OUT_OF_RESOURCE;
+            goto node_leader_out;
+        }
     }
 
     /* Up Iscatterv */
@@ -382,7 +413,8 @@ node_leader_out:
     if (low_displs) {
         free(low_displs);
     }
-    if (tmp_buf) {
+    /* Free tmp_buf when not using persist buffers */
+    if (!mca_coll_han_component.han_use_persist_buffers && total_rsize > 0) {
         free(tmp_buf);
     }
 

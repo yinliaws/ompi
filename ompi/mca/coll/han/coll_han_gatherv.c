@@ -219,10 +219,23 @@ int mca_coll_han_gatherv_intra(const void *sbuf, size_t scount, struct ompi_data
         if (need_bounce_buf) {
             ptrdiff_t rsize, rgap;
             rsize = opal_datatype_span(&rdtype->super, total_up_rcounts, &rgap);
-            bounce_buf = malloc(rsize);
-            if (!bounce_buf) {
-                err = OMPI_ERR_OUT_OF_RESOURCE;
-                goto root_out;
+            if (mca_coll_han_component.han_use_persist_buffers) {
+                if (han_module->gatherv_bounce_persist.size < (size_t)rsize) {
+                    char *p = realloc(han_module->gatherv_bounce_persist.buf, rsize);
+                    if (!p) {
+                        err = OMPI_ERR_OUT_OF_RESOURCE;
+                        goto root_out;
+                    }
+                    han_module->gatherv_bounce_persist.buf = p;
+                    han_module->gatherv_bounce_persist.size = rsize;
+                }
+                bounce_buf = han_module->gatherv_bounce_persist.buf;
+            } else {
+                bounce_buf = malloc(rsize);
+                if (!bounce_buf) {
+                    err = OMPI_ERR_OUT_OF_RESOURCE;
+                    goto root_out;
+                }
             }
 
             /* Calculate displacements for the inter-node gatherv */
@@ -276,7 +289,7 @@ int mca_coll_han_gatherv_intra(const void *sbuf, size_t scount, struct ompi_data
         if (up_peer_ub) {
             free(up_peer_ub);
         }
-        if (bounce_buf) {
+        if (!mca_coll_han_component.han_use_persist_buffers) {
             free(bounce_buf);
         }
 
@@ -312,6 +325,7 @@ int mca_coll_han_gatherv_intra(const void *sbuf, size_t scount, struct ompi_data
     /* #################### Node leaders ########################### */
 
     char *tmp_buf = NULL;
+    size_t total_rsize = 0;
 
     /* Allocate a temporary array to gather the data size, i.e. data type size x count,
      * in bytes from local peers */
@@ -332,16 +346,32 @@ int mca_coll_han_gatherv_intra(const void *sbuf, size_t scount, struct ompi_data
         goto node_leader_out;
     }
 
-    size_t total_rsize = 0;
+    total_rsize = 0;
     for (int i = 0; i < low_size; ++i) {
         low_displs[i] = i > 0 ? low_displs[i - 1] + low_rcounts[i - 1] : 0;
         total_rsize += low_rcounts[i];
     }
 
-    tmp_buf = (char *) malloc(total_rsize); /* tmp_buf is still valid if total_rsize is 0 */
-    if (!tmp_buf) {
-        err = OMPI_ERR_OUT_OF_RESOURCE;
-        goto node_leader_out;
+    /* Persistent inter-node send buffer (realloc-to-HWM) */
+    if (total_rsize == 0) {
+        tmp_buf = (char *)&tmp_buf;  /* non-NULL sentinel for zero-size case */
+    } else if (mca_coll_han_component.han_use_persist_buffers) {
+        if (han_module->gatherv_persist.size < total_rsize) {
+            char *p = realloc(han_module->gatherv_persist.buf, total_rsize);
+            if (!p) {
+                err = OMPI_ERR_OUT_OF_RESOURCE;
+                goto node_leader_out;
+            }
+            han_module->gatherv_persist.buf = p;
+            han_module->gatherv_persist.size = total_rsize;
+        }
+        tmp_buf = han_module->gatherv_persist.buf;
+    } else {
+        tmp_buf = (char *) malloc(total_rsize);
+        if (!tmp_buf) {
+            err = OMPI_ERR_OUT_OF_RESOURCE;
+            goto node_leader_out;
+        }
     }
 
     /* Low Gatherv */
@@ -363,7 +393,7 @@ node_leader_out:
     if (low_displs) {
         free(low_displs);
     }
-    if (tmp_buf) {
+    if (!mca_coll_han_component.han_use_persist_buffers && total_rsize > 0) {
         free(tmp_buf);
     }
 
