@@ -158,13 +158,13 @@ mca_coll_han_gather_intra(const void *sbuf, size_t scount,
             rsize = opal_datatype_span(&rdtype->super,
                                        (int64_t)rcount * w_size,
                                        &rgap);
-            if (han_module->gather_reorder_persist_size < (size_t)rsize) {
-                char *p = realloc(han_module->gather_reorder_persist, rsize);
+            if (han_module->gather_reorder_persist.size < (size_t)rsize) {
+                char *p = realloc(han_module->gather_reorder_persist.buf, rsize);
                 if (NULL == p) return OMPI_ERR_OUT_OF_RESOURCE;
-                han_module->gather_reorder_persist = p;
-                han_module->gather_reorder_persist_size = rsize;
+                han_module->gather_reorder_persist.buf = p;
+                han_module->gather_reorder_persist.size = rsize;
             }
-            reorder_buf = han_module->gather_reorder_persist;
+            reorder_buf = han_module->gather_reorder_persist.buf;
             /* rgap is the size of unused space at the start of the datatype */
             reorder_rbuf = reorder_buf - rgap;
 
@@ -382,13 +382,13 @@ mca_coll_han_gather_intra_simple(const void *sbuf, size_t scount,
             ptrdiff_t rsize = opal_datatype_span(&rdtype->super,
                                                  (int64_t)rcount * w_size,
                                                  &rgap);
-            if (han_module->gather_reorder_persist_size < (size_t)rsize) {
-                char *p = realloc(han_module->gather_reorder_persist, rsize);
+            if (han_module->gather_reorder_persist.size < (size_t)rsize) {
+                char *p = realloc(han_module->gather_reorder_persist.buf, rsize);
                 if (NULL == p) return OMPI_ERR_OUT_OF_RESOURCE;
-                han_module->gather_reorder_persist = p;
-                han_module->gather_reorder_persist_size = rsize;
+                han_module->gather_reorder_persist.buf = p;
+                han_module->gather_reorder_persist.size = rsize;
             }
-            reorder_buf = han_module->gather_reorder_persist;
+            reorder_buf = han_module->gather_reorder_persist.buf;
             reorder_buf_start = reorder_buf - rgap;
         }
 

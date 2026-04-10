@@ -183,14 +183,16 @@ static void mca_coll_han_module_construct(mca_coll_han_module_t * module)
     module->cached_topo = NULL;
     module->cached_gather_buf = NULL;
     module->cached_gather_buf_size = 0;
-    module->scatter_persist = NULL;
-    module->scatter_persist_size = 0;
-    module->scatter_reorder_persist = NULL;
-    module->scatter_reorder_persist_size = 0;
-    module->gather_reorder_persist = NULL;
-    module->gather_reorder_persist_size = 0;
-    module->reduce_tmp_persist = NULL;
-    module->reduce_tmp_persist_size = 0;
+    han_persist_buf_init(&module->scatter_persist);
+    han_persist_buf_init(&module->scatter_reorder_persist);
+    han_persist_buf_init(&module->gather_reorder_persist);
+    han_persist_buf_init(&module->allgather_reorder_persist);
+    han_persist_buf_init(&module->allgather_gather_persist);
+    han_persist_buf_init(&module->scatterv_persist);
+    han_persist_buf_init(&module->scatterv_bounce_persist);
+    han_persist_buf_init(&module->gatherv_persist);
+    han_persist_buf_init(&module->gatherv_bounce_persist);
+    han_persist_buf_init(&module->reduce_tmp_persist);
     module->is_mapbycore = false;
     module->storage_initialized = false;
     for( i = 0; i < NB_TOPO_LVL; i++ ) {
@@ -257,21 +259,16 @@ mca_coll_han_module_destruct(mca_coll_han_module_t * module)
         module->cached_gather_buf_size = 0;
     }
 
-    free(module->scatter_persist);
-    module->scatter_persist = NULL;
-    module->scatter_persist_size = 0;
-
-    free(module->scatter_reorder_persist);
-    module->scatter_reorder_persist = NULL;
-    module->scatter_reorder_persist_size = 0;
-
-    free(module->gather_reorder_persist);
-    module->gather_reorder_persist = NULL;
-    module->gather_reorder_persist_size = 0;
-
-    free(module->reduce_tmp_persist);
-    module->reduce_tmp_persist = NULL;
-    module->reduce_tmp_persist_size = 0;
+    han_persist_buf_free(&module->scatter_persist);
+    han_persist_buf_free(&module->scatter_reorder_persist);
+    han_persist_buf_free(&module->gather_reorder_persist);
+    han_persist_buf_free(&module->reduce_tmp_persist);
+    han_persist_buf_free(&module->allgather_reorder_persist);
+    han_persist_buf_free(&module->allgather_gather_persist);
+    han_persist_buf_free(&module->scatterv_persist);
+    han_persist_buf_free(&module->scatterv_bounce_persist);
+    han_persist_buf_free(&module->gatherv_persist);
+    han_persist_buf_free(&module->gatherv_bounce_persist);
 
     for(i=0 ; i<NB_TOPO_LVL ; i++) {
         if(NULL != module->sub_comm[i]) {

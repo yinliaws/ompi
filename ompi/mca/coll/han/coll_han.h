@@ -330,10 +330,32 @@ typedef struct mca_coll_han_component_t {
     int64_t han_packbuf_max_count;
     int64_t han_packbuf_bytes;
 
+    /* Persist-buffer optimization (0 = disabled, use malloc/free) */
+    bool han_use_persist_buffers;
+
     /* Fragment size for buffer reuse optimization (0 = disabled) */
     size_t han_fragment_size;
     size_t han_large_fragment_size;
 } mca_coll_han_component_t;
+
+/** Realloc-to-HWM persistent buffer (buf + tracked size). */
+typedef struct {
+    char  *buf;
+    size_t size;
+} han_persist_buf_t;
+
+static inline void han_persist_buf_init(han_persist_buf_t *p)
+{
+    p->buf  = NULL;
+    p->size = 0;
+}
+
+static inline void han_persist_buf_free(han_persist_buf_t *p)
+{
+    free(p->buf);
+    p->buf  = NULL;
+    p->size = 0;
+}
 
 /*
  * Structure used to store what is necessary for the collective operations
@@ -436,18 +458,17 @@ typedef struct mca_coll_han_module_t {
     /* Cached gather buffer for three-tier allocation */
     void *cached_gather_buf;
     size_t cached_gather_buf_size;
-    /* Persistent buffer for scatter inter-node recv (realloc-to-HWM) */
-    char *scatter_persist;
-    size_t scatter_persist_size;
-    /* Persistent scatter root reorder buffer (realloc-to-HWM) */
-    char *scatter_reorder_persist;
-    size_t scatter_reorder_persist_size;
-    /* Persistent gather root reorder buffer (realloc-to-HWM) */
-    char *gather_reorder_persist;
-    size_t gather_reorder_persist_size;
-    /* Persistent reduce task-based tmp buffer (realloc-to-HWM) */
-    char *reduce_tmp_persist;
-    size_t reduce_tmp_persist_size;
+    /* Persistent buffers (realloc-to-HWM, gated by han_use_persist_buffers) */
+    han_persist_buf_t scatter_persist;
+    han_persist_buf_t scatter_reorder_persist;
+    han_persist_buf_t gather_reorder_persist;
+    han_persist_buf_t allgather_reorder_persist;
+    han_persist_buf_t allgather_gather_persist;
+    han_persist_buf_t reduce_tmp_persist;
+    han_persist_buf_t scatterv_persist;
+    han_persist_buf_t scatterv_bounce_persist;
+    han_persist_buf_t gatherv_persist;
+    han_persist_buf_t gatherv_bounce_persist;
 } mca_coll_han_module_t;
 OBJ_CLASS_DECLARATION(mca_coll_han_module_t);
 

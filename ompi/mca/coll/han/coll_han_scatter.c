@@ -268,13 +268,13 @@ int mca_coll_han_scatter_us_task(void *task_args)
         rsize = opal_datatype_span(&dtype->super, (int64_t) count * low_size, &rgap);
 
         /* Persistent inter-node receive buffer (realloc-to-HWM) */
-        if (t->han_module->scatter_persist_size < (size_t)rsize) {
-            char *p = realloc(t->han_module->scatter_persist, rsize);
+        if (t->han_module->scatter_persist.size < (size_t)rsize) {
+            char *p = realloc(t->han_module->scatter_persist.buf, rsize);
             if (NULL == p) return OMPI_ERR_OUT_OF_RESOURCE;
-            t->han_module->scatter_persist = p;
-            t->han_module->scatter_persist_size = rsize;
+            t->han_module->scatter_persist.buf = p;
+            t->han_module->scatter_persist.size = rsize;
         }
-        char *tmp_buf = t->han_module->scatter_persist;
+        char *tmp_buf = t->han_module->scatter_persist.buf;
         char *tmp_rbuf = tmp_buf - rgap;
 
         OPAL_OUTPUT_VERBOSE((30, mca_coll_han_component.han_output,
@@ -407,13 +407,13 @@ mca_coll_han_scatter_intra_simple(const void *sbuf, size_t scount,
                                  "[%d]: Han scatter: needs reordering or compacting: ", w_rank));
 
             size_t reorder_size = (size_t)block_size * w_size;
-            if (han_module->scatter_reorder_persist_size < reorder_size) {
-                char *p = realloc(han_module->scatter_reorder_persist, reorder_size);
+            if (han_module->scatter_reorder_persist.size < reorder_size) {
+                char *p = realloc(han_module->scatter_reorder_persist.buf, reorder_size);
                 if (NULL == p) return OMPI_ERROR;
-                han_module->scatter_reorder_persist = p;
-                han_module->scatter_reorder_persist_size = reorder_size;
+                han_module->scatter_reorder_persist.buf = p;
+                han_module->scatter_reorder_persist.size = reorder_size;
             }
-            reorder_buf = han_module->scatter_reorder_persist;
+            reorder_buf = han_module->scatter_reorder_persist.buf;
 
             ptrdiff_t extent, block_extent;
             ompi_datatype_type_extent(dtype, &extent);
@@ -455,13 +455,13 @@ mca_coll_han_scatter_intra_simple(const void *sbuf, size_t scount,
             tmp_buf = NULL;
         }
         if (tmp_fl_src == 0) {
-            if (han_module->scatter_persist_size < tmp_total) {
-                char *p = realloc(han_module->scatter_persist, tmp_total);
+            if (han_module->scatter_persist.size < tmp_total) {
+                char *p = realloc(han_module->scatter_persist.buf, tmp_total);
                 if (NULL == p) return OMPI_ERR_OUT_OF_RESOURCE;
-                han_module->scatter_persist = p;
-                han_module->scatter_persist_size = tmp_total;
+                han_module->scatter_persist.buf = p;
+                han_module->scatter_persist.size = tmp_total;
             }
-            tmp_buf = han_module->scatter_persist;
+            tmp_buf = han_module->scatter_persist.buf;
         }
 
         up_comm->c_coll->coll_scatter((char *)reorder_buf,

@@ -150,13 +150,13 @@ mca_coll_han_reduce_intra(const void *sbuf,
     } else if (low_rank == root_low_rank) {
         /* allocate 2 temporary segments on node leaders that are not the global root */
         size_t needed = 2*extent*seg_count;
-        if (han_module->reduce_tmp_persist_size < needed) {
-            char *p = realloc(han_module->reduce_tmp_persist, needed);
+        if (han_module->reduce_tmp_persist.size < needed) {
+            char *p = realloc(han_module->reduce_tmp_persist.buf, needed);
             if (NULL == p) return OMPI_ERR_OUT_OF_RESOURCE;
-            han_module->reduce_tmp_persist = p;
-            han_module->reduce_tmp_persist_size = needed;
+            han_module->reduce_tmp_persist.buf = p;
+            han_module->reduce_tmp_persist.size = needed;
         }
-        tmp_rbuf = han_module->reduce_tmp_persist;
+        tmp_rbuf = han_module->reduce_tmp_persist.buf;
         is_tmp_rbuf = true;
     }
 
