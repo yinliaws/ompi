@@ -1019,6 +1019,26 @@ static void am_rdma_process_atomic(mca_btl_base_module_t *btl,
         abort();
     }
 
+    /* The target address arrives over the wire from the initiator, and the
+     * only thing standing between a bad one and a fault in opal_atomic_*()
+     * below is this check.  An address that is not naturally aligned for its
+     * operand size cannot be operated on atomically at all, and a NULL one
+     * cannot be right, so both are treated the same way as the bad size
+     * above: the layer that issued the operation has a bug, and reporting
+     * the address is far more use than faulting.  Without this, a bad
+     * address produced on one node becomes a fault on a different node,
+     * with a backtrace that names this file and nothing about the origin. */
+    if (0 == hdr->target_address
+        || 0 != (hdr->target_address & (uint64_t) (hdr->data.atomic.size - 1))) {
+        BTL_ERROR(("Invalid target address %p for a %hu byte active-message "
+                   "atomic of type %d on btl %s (initiator context 0x%" PRIx64 ")",
+                   (void *) (intptr_t) hdr->target_address, hdr->data.atomic.size,
+                   (int) hdr->type,
+                   btl->btl_component->btl_version.mca_component_name,
+                   hdr->context));
+        abort();
+    }
+
     BTL_VERBOSE(("got active-message atomic request. hdr->context=0x%" PRIx64
                  ", target_address=%p, "
                  "segment 0 size=%" PRIu64,
