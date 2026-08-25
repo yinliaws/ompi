@@ -108,6 +108,10 @@ struct ompi_osc_rdma_component_t {
     /** Use network AMOs when available */
     bool acc_use_amo;
 
+    /** Allow the shared state optimization when the BTL guarantees that
+     * CPU atomics and BTL atomics are atomic with respect to each other */
+    bool use_cpu_atomics;
+
     /** Priority of the osc/rdma component */
     unsigned int priority;
 
