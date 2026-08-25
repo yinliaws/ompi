@@ -218,6 +218,19 @@ static int ompi_osc_rdma_component_register (void)
                                            &mca_osc_rdma_component.acc_use_amo);
     free(description_str);
 
+    mca_osc_rdma_component.use_cpu_atomics = true;
+    opal_asprintf(&description_str, "Enable the shared state optimization, which uses CPU atomics "
+             "instead of BTL atomics for the window state of peers on the same node. This is "
+             "only used when the selected BTL guarantees that CPU atomics and BTL atomics are "
+             "atomic with respect to each other. Setting this to false forces same-node state "
+             "atomics through the BTL, which is slower but can be used to work around a BTL "
+             "that reports global atomicity incorrectly (default: %s)",
+             mca_osc_rdma_component.use_cpu_atomics ? "true" : "false");
+    (void) mca_base_component_var_register(&mca_osc_rdma_component.super.osc_version, "use_cpu_atomics",
+                                           description_str, MCA_BASE_VAR_TYPE_BOOL, NULL, 0, 0, OPAL_INFO_LVL_5,
+                                           MCA_BASE_VAR_SCOPE_GROUP, &mca_osc_rdma_component.use_cpu_atomics);
+    free(description_str);
+
     mca_osc_rdma_component.buffer_size = 32768;
     opal_asprintf(&description_str, "Size of temporary buffers (default: %d)", mca_osc_rdma_component.buffer_size);
     (void) mca_base_component_var_register (&mca_osc_rdma_component.super.osc_version, "buffer_size", description_str,
@@ -611,18 +624,18 @@ static int allocate_state_shared (ompi_osc_rdma_module_t *module, void **base, s
 
     if (module->single_node) {
         use_cpu_atomics = true;
-    } else if (module->use_accelerated_btl) {
-        use_cpu_atomics = !!(module->accelerated_btl->btl_flags & MCA_BTL_ATOMIC_SUPPORTS_GLOB);
-    } else {
-        /* using the shared state optimization that is enabled by
-         * being able to use cpu atomics was never enabled for
-         * alternate btls, due to a previous bug in the enablement
-         * logic when alternate btls were first supported.  It is
-         * likely that this optimization could work with sufficient
-         * testing, but for now, always disable to not introduce new
-         * correctness risks.
-         */
+    } else if (!mca_osc_rdma_component.use_cpu_atomics) {
         use_cpu_atomics = false;
+    } else {
+        /* the shared state optimization requires that atomics issued through
+         * the btl be atomic with respect to atomics issued by the cpu, since
+         * a peer on this node will update the state directly while a peer on
+         * another node reaches it through the btl.  module->atomic_flags
+         * reports that guarantee for both the accelerated and the alternate
+         * btl case: for alternate btls the atomics are emulated as active
+         * messages that the target's cpu applies with opal_atomic_*(), so
+         * they are cpu atomics on the same memory by construction. */
+        use_cpu_atomics = !!(module->atomic_flags & MCA_BTL_ATOMIC_SUPPORTS_GLOB);
     }
 
     if (1 == local_size) {
