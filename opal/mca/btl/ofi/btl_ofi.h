@@ -164,6 +164,7 @@ struct mca_btl_ofi_component_t {
     int mode;
     int rd_num;
     bool two_sided_enabled;
+    bool rails_within_one_pci_root;
 
     size_t namelen;
 
