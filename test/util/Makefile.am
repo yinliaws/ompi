@@ -39,6 +39,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/test/support
 check_PROGRAMS = \
 	opal_bit_ops \
 	opal_path_nfs \
+	opal_show_help_threads \
 	bipartite_graph
 
 TESTS = \
@@ -78,6 +79,12 @@ opal_bit_ops_LDADD = \
         $(top_builddir)/opal/lib@OPAL_LIB_PREFIX@open-pal.la \
         $(top_builddir)/test/support/libsupport.a
 opal_bit_ops_DEPENDENCIES = $(opal_path_nfs_LDADD)
+
+opal_show_help_threads_SOURCES = opal_show_help_threads.c
+opal_show_help_threads_LDADD = \
+        $(top_builddir)/opal/lib@OPAL_LIB_PREFIX@open-pal.la \
+        $(top_builddir)/test/support/libsupport.a
+opal_show_help_threads_DEPENDENCIES = $(opal_show_help_threads_LDADD)
 
 opal_path_nfs_SOURCES = opal_path_nfs.c
 opal_path_nfs_LDADD = \
