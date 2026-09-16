@@ -33,8 +33,13 @@ struct mca_mtl_ofi_endpoint_t {
     /** MTL instance that created this connection */
     struct mca_mtl_ofi_module_t *mtl_ofi_module;
 
-    /** The peer's fi_addr */
+    /** The peer's fi_addr on rail 0 */
     fi_addr_t peer_fiaddr;
+
+    /** The peer's fi_addr on each stripe rail, and how many of them are usable
+     *  for this peer -- the smaller of what we opened and what the peer did. */
+    fi_addr_t rail_fiaddr[MTL_OFI_MAX_STRIPE_RAILS];
+    int num_rails;
 };
 
 typedef struct mca_mtl_ofi_endpoint_t  mca_mtl_ofi_endpoint_t;

@@ -42,6 +42,33 @@ struct ompi_mtl_ofi_request_t {
     /** Completion count used by blocking and/or synchronous operations */
     volatile int completion_count;
 
+    /** For a chunk of a striped message, the request the chunk belongs to.
+     *  NULL on every other request. Distinct from parent below, which chains
+     *  a synchronous send to its ack. */
+    struct ompi_mtl_ofi_request_t *stripe_parent;
+
+    /** For a striped message, chunk requests to release on completion. */
+    struct ompi_mtl_ofi_request_t *chunks;
+
+    /** Chunks of a striped message still in flight. The message completes when
+     *  this reaches zero, not when any single chunk does. */
+    volatile int chunks_outstanding;
+
+    /** Which chunk of a striped message this request carries. */
+    int stripe_index;
+
+    /** How many chunks this side split the transfer into. */
+    int chunks_expected;
+
+    /** Set on a chunk whose operation was cancelled. fi_cancel is asynchronous and
+     *  the operation still reports to the completion queue, so its callback must
+     *  not charge the message a second time. */
+    bool stripe_cancelled;
+
+    /** Completion entry from chunk 0, which is the one carrying the tag and
+     *  source the caller has to be told about. */
+    struct fi_cq_tagged_entry stripe_wc;
+
     /** Event callback */
     int (*event_callback)(struct fi_cq_tagged_entry *wc,
                           struct ompi_mtl_ofi_request_t*);

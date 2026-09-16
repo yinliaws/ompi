@@ -262,6 +262,19 @@ ompi_mtl_ofi_component_register(void)
                                     MCA_BASE_VAR_SCOPE_READONLY,
                                     &ompi_mtl_ofi.disable_hmem);
 
+    ompi_mtl_ofi.stripe_domains = NULL;
+    mca_base_component_var_register(&mca_mtl_ofi_component.super.mtl_version, "stripe_domains",
+                                    "Comma separated provider domains to open as extra rails for "
+                                    "striping large messages. Empty disables striping.",
+                                    MCA_BASE_VAR_TYPE_STRING, NULL, 0, 0, OPAL_INFO_LVL_9,
+                                    MCA_BASE_VAR_SCOPE_READONLY, &ompi_mtl_ofi.stripe_domains);
+
+    ompi_mtl_ofi.stripe_threshold = 65536;
+    mca_base_component_var_register(&mca_mtl_ofi_component.super.mtl_version, "stripe_threshold",
+                                    "Messages of at least this many bytes are striped.",
+                                    MCA_BASE_VAR_TYPE_SIZE_T, NULL, 0, 0, OPAL_INFO_LVL_9,
+                                    MCA_BASE_VAR_SCOPE_READONLY, &ompi_mtl_ofi.stripe_threshold);
+
     return opal_common_ofi_mca_register(&mca_mtl_ofi_component.super.mtl_version);
 }
 
@@ -564,6 +577,271 @@ static int ompi_mtl_ofi_init_regular_ep(struct fi_info * prov, int universe_size
 
     return ret;
 }
+
+/*
+ * Open one rail on the device described by info: a plain endpoint with its own AV
+ * and CQ, created from the same fi_info that produced rail 0 apart from the domain,
+ * so nothing about the provider contract changes. In particular this does not ask
+ * for FI_RMA, which on EFA would drag in FI_MR_LOCAL and cost the host path dearly.
+ */
+static int ompi_mtl_ofi_open_one_rail(struct fi_info *info, mca_mtl_ofi_rail_t *rail)
+{
+    struct fi_cq_attr cq_attr = {0};
+    struct fi_av_attr av_attr = {0};
+    int ret;
+
+    cq_attr.format = FI_CQ_FORMAT_TAGGED;
+    cq_attr.size = ompi_mtl_ofi.ofi_progress_event_count;
+
+    ret = opal_common_ofi_fi_fabric(info->fabric_attr, &rail->fabric);
+    if (0 != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_fabric failed");
+        return OMPI_ERROR;
+    }
+
+    ret = opal_common_ofi_fi_domain(rail->fabric, info, &rail->domain);
+    if (0 != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_domain failed");
+        return OMPI_ERROR;
+    }
+
+    ret = fi_endpoint(rail->domain, info, &rail->ep, NULL);
+    if (0 != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_endpoint failed");
+        return OMPI_ERROR;
+    }
+
+    ret = fi_cq_open(rail->domain, &cq_attr, &rail->cq, NULL);
+    if (0 != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_cq_open failed");
+        return OMPI_ERROR;
+    }
+
+    av_attr.type = (MTL_OFI_AV_TABLE == av_type) ? FI_AV_TABLE : FI_AV_MAP;
+    ret = fi_av_open(rail->domain, &av_attr, &rail->av, NULL);
+    if (0 != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_av_open failed");
+        return OMPI_ERROR;
+    }
+
+    ret = fi_ep_bind(rail->ep, (fid_t) rail->cq, FI_TRANSMIT | FI_RECV);
+    if (0 != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_ep_bind CQ failed");
+        return OMPI_ERROR;
+    }
+
+    ret = fi_ep_bind(rail->ep, (fid_t) rail->av, 0);
+    if (0 != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_ep_bind AV failed");
+        return OMPI_ERROR;
+    }
+
+    ret = fi_enable(rail->ep);
+    if (0 != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_enable failed");
+        return OMPI_ERROR;
+    }
+
+    ret = opal_common_ofi_fi_getname((fid_t) rail->ep, &rail->epname, &rail->epnamelen);
+    if (OMPI_SUCCESS != ret) {
+        MTL_OFI_LOG_FI_ERR(ret, "stripe rail fi_getname failed");
+        return OMPI_ERROR;
+    }
+
+    rail->domain_name = strdup(info->domain_attr->name);
+    OBJ_CONSTRUCT(&rail->lock, opal_mutex_t);
+
+    ret = ompi_mtl_ofi_rail_rcache_init(rail);
+    if (OMPI_SUCCESS != ret) {
+        return ret;
+    }
+
+    opal_output_verbose(1, opal_common_ofi.output, "%s:%d: stripe rail on domain %s\n",
+                        __FILE__, __LINE__, rail->domain_name);
+
+    return OMPI_SUCCESS;
+}
+
+/*
+ * Close every rail that was opened and forget them. Safe to call with rails that
+ * were only partly set up, and safe to call twice, so every path that gives up on
+ * striping can use it rather than leaving endpoints and domains behind.
+ */
+static void ompi_mtl_ofi_close_stripe_rails(int count)
+{
+    if (NULL == ompi_mtl_ofi.stripe_rails) {
+        ompi_mtl_ofi.num_stripe_rails = 0;
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        mca_mtl_ofi_rail_t *rail = &ompi_mtl_ofi.stripe_rails[i];
+
+        if (NULL != rail->ep) {
+            (void) fi_close((fid_t) rail->ep);
+        }
+        if (NULL != rail->cq) {
+            (void) fi_close((fid_t) rail->cq);
+        }
+        if (NULL != rail->av) {
+            (void) fi_close((fid_t) rail->av);
+        }
+        if (NULL != rail->rcache) {
+            mca_rcache_base_module_destroy(rail->rcache);
+            rail->rcache = NULL;
+        }
+        if (NULL != rail->domain) {
+            (void) opal_common_ofi_domain_release(rail->domain);
+        }
+        if (NULL != rail->fabric) {
+            (void) opal_common_ofi_fabric_release(rail->fabric);
+        }
+        if (NULL != rail->domain_name) {
+            OBJ_DESTRUCT(&rail->lock);
+        }
+        free(rail->domain_name);
+        free(rail->epname);
+        rail->domain_name = NULL;
+        rail->epname = NULL;
+    }
+
+    free(ompi_mtl_ofi.stripe_rails);
+    ompi_mtl_ofi.stripe_rails = NULL;
+    ompi_mtl_ofi.num_stripe_rails = 0;
+}
+
+/*
+ * Decide which devices this rank stripes across, and open them.
+ *
+ * Rails per rank is num_devices / num_local_procs, the same arithmetic btl/ofi uses,
+ * so a node's devices are divided among its ranks rather than contended. One rail per
+ * rank means no striping, which is the right answer: at that density the ranks already
+ * cover the devices between them. Within the set of devices equally close to this
+ * rank's accelerator, the rank takes a run starting at its own position, so ranks
+ * sharing a set do not land on the same device.
+ *
+ * mtl_ofi_stripe_domains overrides the choice with an explicit list, for experiments.
+ */
+static int ompi_mtl_ofi_open_stripe_rails(struct fi_info *providers)
+{
+    struct fi_info *near[MTL_OFI_MAX_STRIPE_RAILS * 2];
+    int near_count = 0, opened = 0, ret;
+    uint32_t rail0, peers_here;
+    int local_procs = 1 + ompi_process_info.num_local_peers;
+    int total = 0, want;
+    char **names = NULL;
+
+    if (NULL != ompi_mtl_ofi.stripe_domains && '\0' != ompi_mtl_ofi.stripe_domains[0]) {
+        int nnames;
+
+        names = opal_argv_split(ompi_mtl_ofi.stripe_domains, ',');
+        if (NULL == names) {
+            return OMPI_SUCCESS;
+        }
+        nnames = opal_argv_count(names);
+        if (nnames > MTL_OFI_MAX_STRIPE_RAILS) {
+            /* rail_fiaddr[] on the endpoint is this long, so more names than that
+             * cannot be addressed */
+            opal_output_verbose(1, opal_common_ofi.output,
+                                "%s:%d: %d stripe domains named, using the first %d\n",
+                                __FILE__, __LINE__, nnames, MTL_OFI_MAX_STRIPE_RAILS);
+            nnames = MTL_OFI_MAX_STRIPE_RAILS;
+        }
+
+        ompi_mtl_ofi.stripe_rails = calloc(nnames, sizeof(mca_mtl_ofi_rail_t));
+        if (NULL == ompi_mtl_ofi.stripe_rails) {
+            opal_argv_free(names);
+            return OMPI_ERR_OUT_OF_RESOURCE;
+        }
+
+        for (int i = 0; i < nnames; i++) {
+            struct fi_info *info = providers;
+
+            while (NULL != info && 0 != strcmp(info->domain_attr->name, names[i])) {
+                info = info->next;
+            }
+            if (NULL == info) {
+                opal_output_verbose(1, opal_common_ofi.output,
+                                    "%s:%d: stripe rail domain %s not offered\n",
+                                    __FILE__, __LINE__, names[i]);
+                continue;
+            }
+
+            ret = ompi_mtl_ofi_open_one_rail(info, &ompi_mtl_ofi.stripe_rails[opened]);
+            if (OMPI_SUCCESS != ret) {
+                opal_argv_free(names);
+                /* opened + 1 so the rail that failed part way is cleaned up too */
+                ompi_mtl_ofi_close_stripe_rails(opened + 1);
+                return ret;
+            }
+            opened++;
+        }
+
+        opal_argv_free(names);
+        ompi_mtl_ofi.num_stripe_rails = opened;
+        return OMPI_SUCCESS;
+    }
+
+    for (struct fi_info *i = providers; NULL != i; i = i->next) {
+        total++;
+    }
+
+    want = (0 < local_procs) ? total / local_procs : 1;
+    if (want > MTL_OFI_MAX_STRIPE_RAILS + 1) {
+        want = MTL_OFI_MAX_STRIPE_RAILS + 1;
+    }
+    if (2 > want) {
+        opal_output_verbose(1, opal_common_ofi.output,
+                            "%s:%d: %d device(s) for %d local rank(s), no striping\n",
+                            __FILE__, __LINE__, total, local_procs);
+        return OMPI_SUCCESS;
+    }
+
+    ret = opal_common_ofi_nearest_providers(providers,
+                                            (int) (sizeof(near) / sizeof(near[0])),
+                                            near, &near_count);
+    if (OMPI_SUCCESS != ret || 2 > near_count) {
+        opal_output_verbose(1, opal_common_ofi.output,
+                            "%s:%d: no accelerator-local device set, no striping\n",
+                            __FILE__, __LINE__);
+        return OMPI_SUCCESS;
+    }
+
+    ompi_mtl_ofi.stripe_rails = calloc(want - 1, sizeof(mca_mtl_ofi_rail_t));
+    if (NULL == ompi_mtl_ofi.stripe_rails) {
+        return OMPI_ERR_OUT_OF_RESOURCE;
+    }
+
+    /* Where select_provider put rail 0, and how many ranks share this set: one
+     * slot each, so stepping by that number skips over their rail 0 and lands on
+     * a device nobody else is using. */
+    rail0 = ompi_process_info.my_local_rank % (uint32_t) near_count;
+    peers_here = (uint32_t) (near_count / want);
+    if (0 == peers_here) {
+        peers_here = 1;
+    }
+
+    for (int j = 1; j < want; j++) {
+        uint32_t idx = (rail0 + (uint32_t) j * peers_here) % (uint32_t) near_count;
+
+        ret = ompi_mtl_ofi_open_one_rail(near[idx], &ompi_mtl_ofi.stripe_rails[opened]);
+        if (OMPI_SUCCESS != ret) {
+            ompi_mtl_ofi_close_stripe_rails(opened + 1);
+            return ret;
+        }
+        opened++;
+    }
+
+    ompi_mtl_ofi.num_stripe_rails = opened;
+    opal_output_verbose(1, opal_common_ofi.output,
+                        "%s:%d: %d device(s), %d local rank(s): %d rail(s) wanted, %d opened, "
+                        "rail0 slot %u of %d, step %u\n",
+                        __FILE__, __LINE__, total, local_procs, want, opened, rail0,
+                        near_count, peers_here);
+
+    return OMPI_SUCCESS;
+}
+
 
 static mca_mtl_base_module_t*
 ompi_mtl_ofi_component_init(bool enable_progress_threads,
@@ -1102,6 +1380,14 @@ select_prov:
      */
     fi_freeinfo(hints);
     hints = NULL;
+
+    ret = ompi_mtl_ofi_open_stripe_rails(providers);
+    if (OMPI_SUCCESS != ret) {
+        opal_output_verbose(1, opal_common_ofi.output,
+                            "%s:%d: stripe rails unavailable, continuing with one rail\n",
+                            __FILE__, __LINE__);
+    }
+
     fi_freeinfo(providers);
     providers = NULL;
 
@@ -1111,6 +1397,41 @@ select_prov:
     if (OMPI_SUCCESS != ret) {
         MTL_OFI_LOG_FI_ERR(ret, "opal_common_ofi_fi_getname failed");
         goto error;
+    }
+
+    /* Publish rail 0's name followed by each stripe rail's, so a peer can reach
+     * every rail. Names from one provider are all the same length, so the peer
+     * recovers the count by dividing. With no stripe rails this sends exactly
+     * what it always sent. */
+    if (0 < ompi_mtl_ofi.num_stripe_rails) {
+        size_t total = namelen * (1 + ompi_mtl_ofi.num_stripe_rails);
+        char *blob = malloc(total);
+
+        if (NULL == blob) {
+            ret = OMPI_ERR_OUT_OF_RESOURCE;
+            goto error;
+        }
+
+        memcpy(blob, ep_name, namelen);
+        for (int i = 0; i < ompi_mtl_ofi.num_stripe_rails; i++) {
+            if (ompi_mtl_ofi.stripe_rails[i].epnamelen != namelen) {
+                opal_output_verbose(1, opal_common_ofi.output,
+                                    "%s:%d: stripe rail %d name length %zu != %zu, "
+                                    "disabling striping\n", __FILE__, __LINE__, i,
+                                    ompi_mtl_ofi.stripe_rails[i].epnamelen, namelen);
+                ompi_mtl_ofi_close_stripe_rails(ompi_mtl_ofi.num_stripe_rails);
+                break;
+            }
+            memcpy(blob + namelen * (1 + i), ompi_mtl_ofi.stripe_rails[i].epname, namelen);
+        }
+
+        if (0 < ompi_mtl_ofi.num_stripe_rails) {
+            free(ep_name);
+            ep_name = blob;
+            namelen = total;
+        } else {
+            free(blob);
+        }
     }
 
     OFI_COMPAT_MODEX_SEND(ret,
@@ -1124,7 +1445,7 @@ select_prov:
         goto error;
     }
 
-    ompi_mtl_ofi.epnamelen = namelen;
+    ompi_mtl_ofi.epnamelen = namelen / (1 + ompi_mtl_ofi.num_stripe_rails);
     free(ep_name);
 
     /**
@@ -1225,6 +1546,8 @@ ompi_mtl_ofi_finalize(struct mca_mtl_base_module_t *mtl)
     if ((ret = opal_common_ofi_fabric_release(ompi_mtl_ofi.fabric))) {
         goto finalize_err;
     }
+
+    ompi_mtl_ofi_close_stripe_rails(ompi_mtl_ofi.num_stripe_rails);
 
     /* Free memory allocated for TX/RX contexts */
     free(ompi_mtl_ofi.comm_to_context);

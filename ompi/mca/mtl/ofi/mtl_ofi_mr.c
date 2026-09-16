@@ -63,7 +63,11 @@ ompi_mtl_ofi_reg_mem(void *reg_data, void *base, size_t size,
 
 #endif
 
-    ret = fi_mr_regattr(ompi_mtl_ofi.domain, &attr, mr_flags, &mtl_reg->ofi_mr);
+    /* reg_data carries the domain this cache registers against; rail 0's cache
+     * leaves it NULL. */
+    ret = fi_mr_regattr((NULL != reg_data) ? (struct fid_domain *) reg_data
+                                           : ompi_mtl_ofi.domain,
+                        &attr, mr_flags, &mtl_reg->ofi_mr);
     if (0 != ret) {
         opal_show_help("help-mtl-ofi.txt", "Buffer Memory Registration Failed", true,
                        opal_accelerator_base_selected_component.base_version.mca_component_name,
@@ -98,6 +102,38 @@ ompi_mtl_ofi_dereg_mem(void *reg_data, mca_rcache_base_registration_t *reg)
     return OPAL_SUCCESS;
 }
 
+
+int
+ompi_mtl_ofi_rail_rcache_init(mca_mtl_ofi_rail_t *rail)
+{
+    mca_rcache_base_resources_t rcache_resources;
+    char *name = NULL;
+
+    if (NULL != rail->rcache) {
+        return OMPI_SUCCESS;
+    }
+
+    if (0 > opal_asprintf(&name, "mtl-ofi-%s", rail->domain_name)) {
+        return OMPI_ERR_OUT_OF_RESOURCE;
+    }
+
+    rcache_resources.cache_name = name;
+    rcache_resources.reg_data = rail->domain;
+    rcache_resources.sizeof_reg = sizeof(ompi_mtl_ofi_reg_t);
+    rcache_resources.register_mem = ompi_mtl_ofi_reg_mem;
+    rcache_resources.deregister_mem = ompi_mtl_ofi_dereg_mem;
+
+    rail->rcache = mca_rcache_base_module_create("grdma", rail, &rcache_resources);
+    free(name);
+
+    if (NULL == rail->rcache) {
+        opal_output_verbose(1, opal_common_ofi.output,
+                            "creating rcache for stripe rail %s failed", rail->domain_name);
+        return OMPI_ERROR;
+    }
+
+    return OMPI_SUCCESS;
+}
 
 int
 ompi_mtl_ofi_rcache_init(void)

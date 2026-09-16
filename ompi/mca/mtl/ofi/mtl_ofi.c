@@ -228,6 +228,8 @@ ompi_mtl_ofi_add_procs(struct mca_mtl_base_module_t *mtl,
     int count = 0;
     char *ep_name = NULL;
     fi_addr_t *fi_addrs = NULL;
+    fi_addr_t *rail_addrs = NULL;
+    int *peer_rails = NULL;
     mca_mtl_ofi_endpoint_t *endpoint = NULL;
     int num_peers_limit = (1 << ompi_mtl_ofi.num_bits_source_rank) - 1;
 
@@ -249,6 +251,13 @@ ompi_mtl_ofi_add_procs(struct mca_mtl_base_module_t *mtl,
     fi_addrs = malloc(nprocs * sizeof(fi_addr_t));
     if (NULL == fi_addrs) {
         ret = OMPI_ERROR;
+        goto bail;
+    }
+
+    rail_addrs = calloc(nprocs * MTL_OFI_MAX_STRIPE_RAILS, sizeof(fi_addr_t));
+    peer_rails = calloc(nprocs, sizeof(int));
+    if (NULL == rail_addrs || NULL == peer_rails) {
+        ret = OMPI_ERR_OUT_OF_RESOURCE;
         goto bail;
     }
 
@@ -281,6 +290,31 @@ ompi_mtl_ofi_add_procs(struct mca_mtl_base_module_t *mtl,
             ret = OMPI_ERROR;
             goto bail;
         }
+
+        /* Resolve the peer on each rail we share with it. The peer published one
+         * name per rail it opened, so it offers size/epnamelen - 1 stripe rails;
+         * use whichever of us opened fewer. */
+        peer_rails[i] = 0;
+        if (0 < ompi_mtl_ofi.num_stripe_rails && 0 < ompi_mtl_ofi.epnamelen) {
+            int offered = (int) (size / ompi_mtl_ofi.epnamelen) - 1;
+            int usable = (offered < ompi_mtl_ofi.num_stripe_rails)
+                             ? offered : ompi_mtl_ofi.num_stripe_rails;
+
+            for (int r = 0; r < usable; r++) {
+                char *name = (char *) ep_name + ompi_mtl_ofi.epnamelen * (1 + r);
+
+                count = fi_av_insert(ompi_mtl_ofi.stripe_rails[r].av, name, 1,
+                                     &rail_addrs[i * MTL_OFI_MAX_STRIPE_RAILS + r], 0, NULL);
+                if ((count < 0) || (1 != (size_t) count)) {
+                    opal_output_verbose(1, opal_common_ofi.output,
+                                        "%s:%d: fi_av_insert failed on stripe rail %d: %d\n",
+                                        __FILE__, __LINE__, r, count);
+                    ret = OMPI_ERROR;
+                    goto bail;
+                }
+                peer_rails[i]++;
+            }
+        }
     }
 
     /**
@@ -299,6 +333,10 @@ ompi_mtl_ofi_add_procs(struct mca_mtl_base_module_t *mtl,
 
         endpoint->mtl_ofi_module = &ompi_mtl_ofi;
         endpoint->peer_fiaddr = fi_addrs[i];
+        endpoint->num_rails = peer_rails[i];
+        for (int r = 0; r < peer_rails[i]; r++) {
+            endpoint->rail_fiaddr[r] = rail_addrs[i * MTL_OFI_MAX_STRIPE_RAILS + r];
+        }
 
         /* FIXME: What happens if this endpoint already exists? */
         procs[i]->proc_endpoints[OMPI_PROC_ENDPOINT_TAG_MTL] = endpoint;
@@ -312,6 +350,10 @@ ompi_mtl_ofi_add_procs(struct mca_mtl_base_module_t *mtl,
 bail:
     if (fi_addrs)
         free(fi_addrs);
+    if (rail_addrs)
+        free(rail_addrs);
+    if (peer_rails)
+        free(peer_rails);
 
     return ret;
 }
@@ -329,6 +371,13 @@ ompi_mtl_ofi_del_procs(struct mca_mtl_base_module_t *mtl,
         if (NULL != procs[i] &&
             NULL != procs[i]->proc_endpoints[OMPI_PROC_ENDPOINT_TAG_MTL]) {
             endpoint = procs[i]->proc_endpoints[OMPI_PROC_ENDPOINT_TAG_MTL];
+
+            /* the peer was inserted into every rail's AV it shares with us */
+            for (int r = 0; r < endpoint->num_rails; r++) {
+                (void) fi_av_remove(ompi_mtl_ofi.stripe_rails[r].av,
+                                    &endpoint->rail_fiaddr[r], 1, 0);
+            }
+
             ret = fi_av_remove(ompi_mtl_ofi.av, &endpoint->peer_fiaddr, 1, 0);
             if (ret) {
                 opal_output_verbose(1, opal_common_ofi.output,

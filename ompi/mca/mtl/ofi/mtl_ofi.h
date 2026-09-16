@@ -74,6 +74,7 @@ extern int ompi_mtl_ofi_del_comm(struct mca_mtl_base_module_t *mtl,
 int ompi_mtl_ofi_progress_no_inline(void);
 
 int ompi_mtl_ofi_rcache_init(void);
+int ompi_mtl_ofi_rail_rcache_init(mca_mtl_ofi_rail_t *rail);
 
 #if OPAL_HAVE_THREAD_LOCAL
 extern opal_thread_local int ompi_mtl_ofi_per_thread_ctx;
@@ -225,6 +226,9 @@ bail:
     exit(1);
 }
 
+/* defined further down, next to the striping helpers it serves */
+__opal_attribute_always_inline__ static inline int ompi_mtl_ofi_rail_progress(void);
+
 __opal_attribute_always_inline__ static inline int
 ompi_mtl_ofi_progress(void)
 {
@@ -240,6 +244,10 @@ ompi_mtl_ofi_progress(void)
         }
     } else {
         count += ompi_mtl_ofi_context_progress(ctxt_id);
+    }
+
+    if (OPAL_UNLIKELY(0 < ompi_mtl_ofi.stripe_inflight)) {
+        count += ompi_mtl_ofi_rail_progress();
     }
 
 #if OPAL_HAVE_THREAD_LOCAL
@@ -787,6 +795,329 @@ fn_exit:
     return ret;
 }
 
+/*
+ * Offset and size of chunk c when len bytes are split nchunks ways. The
+ * remainder rides on chunk 0 so the rest stay equal sized.
+ */
+__opal_attribute_always_inline__ static inline void
+ompi_mtl_ofi_chunk_range(size_t len, int nchunks, int c, size_t *off, size_t *sz)
+{
+    size_t base = len / (size_t) nchunks;
+    size_t rem = len % (size_t) nchunks;
+
+    if (0 == c) {
+        *off = 0;
+        *sz = base + rem;
+    } else {
+        *off = base * (size_t) c + rem;
+        *sz = base;
+    }
+}
+
+/* Tag for a chunk: the ordinary tag with protocol codepoint 3, which no
+ * application receive can match. */
+__opal_attribute_always_inline__ static inline uint64_t
+ompi_mtl_ofi_chunk_tag(int c_index, int tag)
+{
+    return mtl_ofi_create_send_tag_CQD(c_index, tag) | ompi_mtl_ofi.sync_send
+           | ompi_mtl_ofi.sync_send_ack;
+}
+
+/*
+ * Striping puts chunks on endpoints other than the one application receives are
+ * matched against, so the receiver has to know the source in order to post them.
+ * A wildcard receive does not, and the sender cannot tell that the receiver used
+ * one -- the chunks would simply never be matched. So stripe only on a
+ * communicator that has promised not to use MPI_ANY_SOURCE.
+ */
+__opal_attribute_always_inline__ static inline bool
+ompi_mtl_ofi_should_stripe(mca_mtl_ofi_endpoint_t *endpoint, size_t length,
+                           struct opal_convertor_t *convertor, bool ofi_cq_data,
+                           struct ompi_communicator_t *comm)
+{
+    /* Ordered so that a build or run with no rails stops at the first test. */
+    return OPAL_UNLIKELY(0 < ompi_mtl_ofi.num_stripe_rails)
+           && (length >= ompi_mtl_ofi.stripe_threshold)
+           && (0 < endpoint->num_rails) && ofi_cq_data
+           && OMPI_COMM_CHECK_ASSERT_NO_ANY_SOURCE(comm)
+           && !opal_convertor_need_buffers(convertor);
+}
+
+/*
+ * Cancel chunk receives that are still posted. cancelled_from is the first chunk
+ * index whose receive was never issued or already completed, so only chunks at or
+ * beyond it, and only on the stripe rails, may still be outstanding.
+ */
+__opal_attribute_always_inline__ static inline void
+ompi_mtl_ofi_cancel_chunks(ompi_mtl_ofi_request_t *req, int cancelled_from)
+{
+    if (NULL == req->chunks) {
+        return;
+    }
+
+    for (int c = cancelled_from; c < req->chunks_expected; c++) {
+        if (0 == c) {
+            continue;   /* chunk 0 rides rail 0 and is cancelled by the caller */
+        }
+        req->chunks[c].stripe_cancelled = true;
+        (void) fi_cancel((fid_t) ompi_mtl_ofi.stripe_rails[c - 1].ep,
+                         &req->chunks[c].ctx);
+        OPAL_THREAD_ADD_FETCH32(&ompi_mtl_ofi.stripe_inflight, -1);
+    }
+}
+
+/*
+ * A chunk finished. The message itself owns no OFI operation -- every chunk is a
+ * separate request -- so the last chunk to land is what drives the message's own
+ * callback, with chunk 0's completion entry as the one describing the message.
+ */
+__opal_attribute_always_inline__ static inline int
+ompi_mtl_ofi_chunk_callback(struct fi_cq_tagged_entry *wc,
+                            ompi_mtl_ofi_request_t *chunk)
+{
+    ompi_mtl_ofi_request_t *parent = chunk->stripe_parent;
+
+    assert(NULL != parent);
+
+    /* A cancelled chunk was already accounted for when it was cancelled. */
+    if (chunk->stripe_cancelled) {
+        return OMPI_SUCCESS;
+    }
+
+    OPAL_THREAD_ADD_FETCH32(&ompi_mtl_ofi.stripe_inflight, -1);
+
+    if (0 == chunk->stripe_index) {
+        parent->stripe_wc = *wc;
+
+        /* A receive splits the buffer it was given; the sender split the message.
+         * If those disagree the remaining chunks will not line up, so fail the
+         * request rather than wait for chunks that cannot arrive. */
+        if (OMPI_MTL_OFI_RECV == parent->type
+            && (int) wc->data != parent->chunks_expected) {
+            parent->status.MPI_ERROR = MPI_ERR_TRUNCATE;
+            opal_output_verbose(1, opal_common_ofi.output,
+                                "%s:%d: striped receive expected %d chunks, sender sent %d\n",
+                                __FILE__, __LINE__, parent->chunks_expected,
+                                (int) wc->data);
+            /* the sender sent fewer chunks than we posted receives for; retract
+             * the surplus so a later message does not match them */
+            if ((int) wc->data < parent->chunks_expected) {
+                ompi_mtl_ofi_cancel_chunks(parent, (int) wc->data);
+                parent->chunks_outstanding -= (parent->chunks_expected - (int) wc->data);
+            }
+        }
+    } else if (NULL != chunk->mr) {
+        mca_mtl_ofi_rail_t *rail = &ompi_mtl_ofi.stripe_rails[chunk->stripe_index - 1];
+
+        (void) rail->rcache->rcache_deregister(rail->rcache, &chunk->mr->base);
+        chunk->mr = NULL;
+    }
+
+    if (0 == --parent->chunks_outstanding) {
+        /* report the whole message, not the size of one chunk. 'chunk' points
+         * into the array being freed, so nothing may touch it after this. */
+        parent->stripe_wc.len = parent->length;
+        free(parent->chunks);
+        parent->chunks = NULL;
+        return parent->event_callback(&parent->stripe_wc, parent);
+    }
+
+    return OMPI_SUCCESS;
+}
+
+static int
+ompi_mtl_ofi_chunk_error_callback(struct fi_cq_err_entry *error,
+                                  ompi_mtl_ofi_request_t *chunk)
+{
+    ompi_mtl_ofi_request_t *parent = chunk->stripe_parent;
+
+    if (NULL == parent || chunk->stripe_cancelled) {
+        return OMPI_SUCCESS;
+    }
+
+    OPAL_THREAD_ADD_FETCH32(&ompi_mtl_ofi.stripe_inflight, -1);
+    parent->status.MPI_ERROR = MPI_ERR_INTERN;
+    if (0 == --parent->chunks_outstanding) {
+        parent->stripe_wc.len = parent->length;
+        free(parent->chunks);
+        parent->chunks = NULL;
+        return parent->event_callback(&parent->stripe_wc, parent);
+    }
+
+    return OMPI_SUCCESS;
+}
+
+/*
+ * A chunk failed to be posted. Chunks already accepted will complete and drive the
+ * message's callback, so hand back the accounting for the ones that never went out
+ * and let those complete it with the error. When nothing was posted at all there is
+ * no completion coming, so the caller owns the failure.
+ */
+__opal_attribute_always_inline__ static inline int
+ompi_mtl_ofi_stripe_unwind(ompi_mtl_ofi_request_t *req, int posted, int nchunks, int err)
+{
+    OPAL_THREAD_ADD_FETCH32(&ompi_mtl_ofi.stripe_inflight, -(nchunks - posted));
+    req->chunks_outstanding = posted;
+    req->chunks_expected = posted;
+    req->status.MPI_ERROR = err;
+
+    if (0 == posted) {
+        free(req->chunks);
+        req->chunks = NULL;
+        return err;
+    }
+
+    return OMPI_SUCCESS;
+}
+
+/*
+ * Split a message across rail 0 and the stripe rails. Chunk 0 keeps the ordinary
+ * tag so the peer matches it exactly as it always did; the rest carry protocol
+ * codepoint 3, which no application receive can match.
+ */
+__opal_attribute_always_inline__ static inline int
+ompi_mtl_ofi_stripe_message(ompi_mtl_ofi_request_t *req,
+                            mca_mtl_ofi_endpoint_t *endpoint,
+                            int ctxt_id, void *start, size_t length,
+                            struct ompi_communicator_t *comm, int c_index_for_tag,
+                            int tag, uint64_t match_bits, uint64_t mask_bits,
+                            fi_addr_t sep_peer_fiaddr, bool sending)
+{
+    int nchunks = 1 + endpoint->num_rails;
+    uint64_t chunk_bits = ompi_mtl_ofi_chunk_tag(c_index_for_tag, tag);
+    size_t off, sz;
+    ssize_t ret;
+
+    req->chunks = calloc(nchunks, sizeof(ompi_mtl_ofi_request_t));
+    if (NULL == req->chunks) {
+        return OMPI_ERR_OUT_OF_RESOURCE;
+    }
+
+    req->chunks_outstanding = nchunks;
+    req->chunks_expected = nchunks;
+    OPAL_THREAD_ADD_FETCH32(&ompi_mtl_ofi.stripe_inflight, nchunks);
+
+    for (int c = 0; c < nchunks; c++) {
+        /* posted counts the chunks whose operation was accepted; a failure part
+         * way through has to give back the accounting for the rest, or progress
+         * would poll the rails forever and the message would never complete. */
+        int posted = c;
+
+        ompi_mtl_ofi_request_t *chunk = &req->chunks[c];
+
+        ompi_mtl_ofi_chunk_range(length, nchunks, c, &off, &sz);
+        chunk->type = req->type;
+        chunk->stripe_parent = req;
+        chunk->stripe_index = c;
+        chunk->event_callback = ompi_mtl_ofi_chunk_callback;
+        chunk->error_callback = ompi_mtl_ofi_chunk_error_callback;
+
+        /* Chunk 0 rides rail 0 and can use the message's own registration. The
+         * rest need one from the rail they go out on. */
+        if (0 != c && NULL != req->mr) {
+            uint32_t cache_flags = MCA_RCACHE_FLAGS_ACCELERATOR_MEM;
+            mca_mtl_ofi_rail_t *rail = &ompi_mtl_ofi.stripe_rails[c - 1];
+
+            ret = rail->rcache->rcache_register(rail->rcache, (char *) start + off, sz,
+                                                cache_flags, MCA_RCACHE_ACCESS_ANY,
+                                                (mca_rcache_base_registration_t **) &chunk->mr);
+            if (OPAL_UNLIKELY(OMPI_SUCCESS != ret)) {
+                MTL_OFI_LOG_FI_ERR(ret, "stripe rail registration failed");
+                return ompi_mtl_ofi_stripe_unwind(req, posted, nchunks, ret);
+            }
+        }
+
+        if (sending) {
+            if (0 == c) {
+                /* The count rides in the completion data. Under the assertion
+                 * gate the receiver always knows the source already, so the rank
+                 * usually sent here is redundant for a striped chunk 0. */
+                OFI_RETRY_UNTIL_DONE(fi_tsenddata(ompi_mtl_ofi.ofi_ctxt[ctxt_id].tx_ep,
+                                                  (char *) start + off, sz,
+                                                  (NULL == req->mr) ? NULL
+                                                                    : req->mr->mem_desc,
+                                                  (uint64_t) nchunks, sep_peer_fiaddr,
+                                                  match_bits, (void *) &chunk->ctx), ret);
+            } else {
+                OFI_RETRY_UNTIL_DONE(fi_tsend(ompi_mtl_ofi.stripe_rails[c - 1].ep,
+                                              (char *) start + off, sz,
+                                              (NULL == chunk->mr) ? NULL
+                                                                  : chunk->mr->mem_desc,
+                                              endpoint->rail_fiaddr[c - 1], chunk_bits,
+                                              (void *) &chunk->ctx), ret);
+            }
+        } else {
+            if (0 == c) {
+                OFI_RETRY_UNTIL_DONE(fi_trecv(ompi_mtl_ofi.ofi_ctxt[ctxt_id].rx_ep,
+                                              (char *) start + off, sz,
+                                              (NULL == req->mr) ? NULL
+                                                                : req->mr->mem_desc,
+                                              req->remote_addr, match_bits, mask_bits,
+                                              (void *) &chunk->ctx), ret);
+            } else {
+                OFI_RETRY_UNTIL_DONE(fi_trecv(ompi_mtl_ofi.stripe_rails[c - 1].ep,
+                                              (char *) start + off, sz,
+                                              (NULL == chunk->mr) ? NULL
+                                                                  : chunk->mr->mem_desc,
+                                              endpoint->rail_fiaddr[c - 1], chunk_bits,
+                                              0ULL, (void *) &chunk->ctx), ret);
+            }
+        }
+
+        if (OPAL_UNLIKELY(0 > ret)) {
+            MTL_OFI_LOG_FI_ERR(ret, "striped chunk operation failed");
+            return ompi_mtl_ofi_stripe_unwind(req, posted, nchunks,
+                                              ompi_mtl_ofi_get_error(ret));
+        }
+    }
+
+    return OMPI_SUCCESS;
+}
+
+/* Drain the stripe rails' completion queues. Chunk completions land here. */
+__opal_attribute_always_inline__ static inline int
+ompi_mtl_ofi_rail_progress(void)
+{
+    int count = 0;
+    struct fi_cq_tagged_entry wc[MTL_OFI_MAX_PROG_EVENT_COUNT];
+    struct fi_cq_err_entry error = {0};
+    ompi_mtl_ofi_request_t *req = NULL;
+    ssize_t ret;
+
+    for (int r = 0; r < ompi_mtl_ofi.num_stripe_rails; r++) {
+        mca_mtl_ofi_rail_t *rail = &ompi_mtl_ofi.stripe_rails[r];
+
+        if (ompi_mtl_ofi.mpi_thread_multiple
+            && !opal_mutex_trylock(&rail->lock)) {
+            continue;
+        }
+
+        ret = fi_cq_read(rail->cq, (void *) &wc,
+                         ompi_mtl_ofi.ofi_progress_event_count);
+        if (ret > 0) {
+            count += ret;
+            for (ssize_t i = 0; i < ret; i++) {
+                if (NULL != wc[i].op_context) {
+                    req = TO_OFI_REQ(wc[i].op_context);
+                    (void) req->event_callback(&wc[i], req);
+                }
+            }
+        } else if (OPAL_UNLIKELY(-FI_EAVAIL == ret)) {
+            ret = fi_cq_readerr(rail->cq, &error, 0);
+            if (0 < ret && NULL != error.op_context) {
+                req = TO_OFI_REQ(error.op_context);
+                (void) req->error_callback(&error, req);
+            }
+        }
+
+        if (ompi_mtl_ofi.mpi_thread_multiple) {
+            opal_mutex_unlock(&rail->lock);
+        }
+    }
+
+    return count;
+}
+
 __opal_attribute_always_inline__ static inline int
 ompi_mtl_ofi_send_generic(struct mca_mtl_base_module_t *mtl,
                           struct ompi_communicator_t *comm,
@@ -926,6 +1257,22 @@ ompi_mtl_ofi_send_generic(struct mca_mtl_base_module_t *mtl,
         if (OPAL_UNLIKELY(OMPI_SUCCESS != ompi_ret)) {
             return ompi_ret;
         }
+
+        /* Large contiguous blocking send: stripe across the rails, then fall
+         * through to the same completion wait below. The chunks drive
+         * ofi_req's own callback, which decrements completion_count. */
+        if (ompi_mtl_ofi_should_stripe(endpoint, length, convertor, ofi_cq_data, comm)) {
+            ofi_req.completion_count += 1;
+            ompi_ret = ompi_mtl_ofi_stripe_message(&ofi_req, endpoint, ctxt_id, start, length,
+                                                   comm, c_index_for_tag, tag, match_bits,
+                                                   0ULL, sep_peer_fiaddr, true);
+            if (OPAL_UNLIKELY(OMPI_SUCCESS != ompi_ret)) {
+                ofi_req.status.MPI_ERROR = ompi_ret;
+                goto free_request_buffer;
+            }
+            goto wait_completion;
+        }
+
         ofi_req.completion_count += 1;
         if (ofi_cq_data) {
             OFI_RETRY_UNTIL_DONE(fi_tsenddata(ompi_mtl_ofi.ofi_ctxt[ctxt_id].tx_ep,
@@ -954,6 +1301,7 @@ ompi_mtl_ofi_send_generic(struct mca_mtl_base_module_t *mtl,
         }
     }
 
+wait_completion:
     /**
      * Wait until the request is completed.
      * ompi_mtl_ofi_send_callback() updates this variable.
@@ -1180,6 +1528,20 @@ ompi_mtl_ofi_isend_generic(struct mca_mtl_base_module_t *mtl,
         /* otherwise fall back to the standard fi_tsend path */
     }
 
+    /* A large contiguous message with rails available goes out as one chunk per
+     * rail. completion_count is already 1: the chunks drive this request's own
+     * callback once the last of them lands. */
+    if (ompi_mtl_ofi_should_stripe(endpoint, length, convertor, ofi_cq_data, comm)) {
+        ompi_ret = ompi_mtl_ofi_stripe_message(ofi_req, endpoint, ctxt_id, start, length,
+                                               comm, c_index_for_tag, tag, match_bits,
+                                               0ULL, sep_peer_fiaddr, true);
+        if (OPAL_UNLIKELY(OMPI_SUCCESS != ompi_ret)) {
+            ofi_req->status.MPI_ERROR = ompi_ret;
+            return ompi_ret;
+        }
+
+        return OMPI_SUCCESS;
+    }
 
     if (ofi_cq_data) {
         OFI_RETRY_UNTIL_DONE(fi_tsenddata(ompi_mtl_ofi.ofi_ctxt[ctxt_id].tx_ep,
@@ -1398,6 +1760,21 @@ ompi_mtl_ofi_irecv_generic(struct mca_mtl_base_module_t *mtl,
     ompi_ret = ompi_mtl_ofi_register_buffer(convertor, ofi_req, start);
     if (OPAL_UNLIKELY(OMPI_SUCCESS != ompi_ret)) {
         return ompi_ret;
+    }
+
+    /* Mirror of the send side: a large contiguous receive from a known source,
+     * with rails available, is posted as one receive per rail. */
+    if (MPI_ANY_SOURCE != src && NULL != endpoint
+        && ompi_mtl_ofi_should_stripe(endpoint, length, convertor, ofi_cq_data, comm)) {
+        ompi_ret = ompi_mtl_ofi_stripe_message(ofi_req, endpoint, ctxt_id, start, length,
+                                               comm, comm->c_index, tag, match_bits,
+                                               mask_bits, remote_addr, false);
+        if (OPAL_UNLIKELY(OMPI_SUCCESS != ompi_ret)) {
+            ompi_mtl_ofi_deregister_and_free_buffer(ofi_req);
+            return ompi_ret;
+        }
+
+        return OMPI_SUCCESS;
     }
 
     OFI_RETRY_UNTIL_DONE(fi_trecv(ompi_mtl_ofi.ofi_ctxt[ctxt_id].rx_ep,
@@ -1851,6 +2228,12 @@ ompi_mtl_ofi_cancel(struct mca_mtl_base_module_t *mtl,
              * any pending receive completion event.
              */
             ompi_mtl_ofi_progress();
+
+            /* A striped receive owns a chunk receive on every rail; cancel them
+             * all. Chunk 0, on rail 0, is cancelled by the code just below. */
+            if (NULL != ofi_req->chunks && !ofi_req->req_started) {
+                ompi_mtl_ofi_cancel_chunks(ofi_req, 1);
+            }
 
             if (!ofi_req->req_started) {
                 ctxt_id = ompi_mtl_ofi_map_comm_to_ctxt(ofi_req->comm->c_index);

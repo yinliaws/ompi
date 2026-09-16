@@ -39,6 +39,33 @@ typedef struct mca_mtl_ofi_context_t {
     opal_mutex_t context_lock;
 } mca_mtl_ofi_context_t;
 
+/*
+ * An extra device used only to carry chunks of a large message. Rail 0 is the
+ * module's own scalable endpoint and is not one of these; these are opened
+ * alongside it, on other NICs, with the same provider hints.
+ */
+#define MTL_OFI_MAX_STRIPE_RAILS 8
+
+typedef struct mca_mtl_ofi_rail_t {
+    struct fid_fabric *fabric;
+    struct fid_domain *domain;
+    struct fid_ep *ep;
+    struct fid_cq *cq;
+    struct fid_av *av;
+    char *domain_name;
+    void *epname;
+    size_t epnamelen;
+
+    /** Registrations for this rail. A registration is only valid against the
+     *  domain it was made on, so a rail cannot borrow rail 0's. */
+    mca_rcache_base_module_t *rcache;
+
+    /** Serialises posting and completion handling on this rail. The module's
+     *  contexts have their own locks; a rail is a separate endpoint and CQ and
+     *  needs its own. */
+    opal_mutex_t lock;
+} mca_mtl_ofi_rail_t;
+
 typedef struct mca_mtl_ofi_module_t {
     mca_mtl_base_module_t base;
 
@@ -109,6 +136,22 @@ typedef struct mca_mtl_ofi_module_t {
 
     /** registration cache */
     mca_rcache_base_module_t *rcache;
+
+    /** Extra rails for striping large messages, and how many there are. Zero
+     *  means every code path below behaves as it did before striping existed. */
+    mca_mtl_ofi_rail_t *stripe_rails;
+    int num_stripe_rails;
+
+    /** Comma separated domain names to open as stripe rails (MCA). */
+    char *stripe_domains;
+
+    /** Messages at or above this many bytes are striped. */
+    size_t stripe_threshold;
+
+    /** Chunk operations outstanding across all rails. While this is zero there is
+     *  nothing for the rails' completion queues to report, and reading them would
+     *  only add work to every progress call. */
+    opal_atomic_int32_t stripe_inflight;
 } mca_mtl_ofi_module_t;
 
 extern mca_mtl_ofi_module_t ompi_mtl_ofi;
