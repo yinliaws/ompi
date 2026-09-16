@@ -229,6 +229,21 @@ OPAL_DECLSPEC struct fi_info *opal_common_ofi_select_provider(struct fi_info *pr
 OPAL_DECLSPEC int opal_common_ofi_fi_getname(fid_t fid, void **addr, size_t *addrlen);
 
 /**
+ * Providers closest to this process' accelerator.
+ *
+ * @param provider_list (IN)  list returned by fi_getinfo
+ * @param max_set (IN)        capacity of set
+ * @param set (OUT)           candidates equally close to the accelerator, in
+ *                            provider-list order
+ * @param set_count (OUT)     how many were written
+ *
+ * @return OPAL_SUCCESS, or OPAL_ERR_NOT_AVAILABLE when there is no accelerator,
+ *         no PCI data, or fewer than two providers to choose between.
+ */
+OPAL_DECLSPEC int opal_common_ofi_nearest_providers(struct fi_info *provider_list, int max_set,
+                                                    struct fi_info **set, int *set_count);
+
+/**
  * Get or create fabric object
  *
  * Reuses existing fabric from fabric_attr->fabric if available,

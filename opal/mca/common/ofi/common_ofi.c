@@ -1104,7 +1104,10 @@ static int find_nearest_provider_from_accelerator(struct fi_info *provider_list,
                                                   size_t num_providers,
                                                   int accl_id,
                                                   uint32_t device_rank,
-                                                  struct fi_info **provider)
+                                                  struct fi_info **provider,
+                                                  int max_set,
+                                                  struct fi_info **set,
+                                                  int *set_count)
 {
     hwloc_obj_t accl_dev = NULL, prov_dev = NULL, common_ancestor = NULL;
     int ret = -1, accl_distance = -1, prov_distance = -1, min_distance = INT_MAX;
@@ -1201,6 +1204,23 @@ static int find_nearest_provider_from_accelerator(struct fi_info *provider_list,
         return OPAL_ERR_NOT_AVAILABLE;
     }
 
+    /* Hand back the equidistant set in provider-list order. The caller decides
+     * which of them it wants; every entry is equally close to the accelerator. */
+    if (NULL != set) {
+        int found = 0;
+
+        distance = distances;
+        current_provider = provider_list;
+        while (NULL != current_provider && found < max_set) {
+            if ((uint32_t) min_distance == *(distance++)) {
+                set[found++] = current_provider;
+            }
+            current_provider = current_provider->next;
+        }
+        *set_count = found;
+        return OPAL_SUCCESS;
+    }
+
     provider_rank = device_rank % near_provider_count;
 
     distance = distances;
@@ -1219,6 +1239,51 @@ static int find_nearest_provider_from_accelerator(struct fi_info *provider_list,
     assert(0 == near_provider_count);
 
     return OPAL_ERROR;
+}
+
+/*
+ * Providers closest to this process' accelerator. Fills set[] with up to max_set
+ * candidates that are all equally close, in provider-list order, and reports how
+ * many were found. The caller picks among them -- they are interchangeable as far
+ * as accelerator locality goes, so a caller taking several should stride by its own
+ * position among the local ranks to avoid colliding with its neighbours.
+ */
+int opal_common_ofi_nearest_providers(struct fi_info *provider_list, int max_set,
+                                      struct fi_info **set, int *set_count)
+{
+#if OPAL_OFI_PCI_DATA_AVAILABLE
+    int ret, accel_id = -1, num_providers;
+
+    if (NULL == set || NULL == set_count || 0 >= max_set) {
+        return OPAL_ERR_BAD_PARAM;
+    }
+
+    *set_count = 0;
+
+    if (NULL == opal_accelerator.get_device) {
+        return OPAL_ERR_NOT_AVAILABLE;
+    }
+
+    ret = opal_accelerator.get_device(&accel_id);
+    if (OPAL_SUCCESS != ret || 0 > accel_id) {
+        return OPAL_ERR_NOT_AVAILABLE;
+    }
+
+    ret = opal_hwloc_base_get_topology();
+    if (0 > ret) {
+        return OPAL_ERR_NOT_AVAILABLE;
+    }
+
+    num_providers = count_providers(provider_list);
+    if (2 > num_providers) {
+        return OPAL_ERR_NOT_AVAILABLE;
+    }
+
+    return find_nearest_provider_from_accelerator(provider_list, num_providers, accel_id, 0,
+                                                  NULL, max_set, set, set_count);
+#else
+    return OPAL_ERR_NOT_AVAILABLE;
+#endif /* OPAL_OFI_PCI_DATA_AVAILABLE */
 }
 #endif /* OPAL_OFI_PCI_DATA_AVAILABLE */
 
@@ -1274,7 +1339,7 @@ struct fi_info *opal_common_ofi_select_provider(struct fi_info *provider_list,
 
     if (0 <= accel_id) {
         ret = find_nearest_provider_from_accelerator(provider_list, num_providers, accel_id,
-                                                     device_rank, &provider);
+                                                     device_rank, &provider, 0, NULL, NULL);
         if (OPAL_SUCCESS == ret) {
             goto out;
         }
