@@ -353,6 +353,12 @@ int ompi_mtl_ofi_add_comm(struct mca_mtl_base_module_t *mtl,
     mca_mtl_ofi_ep_type ep_type = (0 == ompi_mtl_ofi.enable_sep) ?
                                   OFI_REGULAR_EP : OFI_SCALABLE_EP;
 
+    /* Ask to be told when the application asserts that this communicator will not
+     * use MPI_ANY_SOURCE. Nothing else on this path subscribes it -- pml/ob1 is the
+     * only other caller -- so without this the assertion never reaches
+     * comm->c_assertions and striping could never turn itself on. */
+    ompi_comm_assert_subscribe(comm, OMPI_COMM_ASSERT_NO_ANY_SOURCE);
+
     if (!OMPI_COMM_IS_GLOBAL_INDEX(comm)) {
         mtl_comm = OBJ_NEW(mca_mtl_comm_t);
 
